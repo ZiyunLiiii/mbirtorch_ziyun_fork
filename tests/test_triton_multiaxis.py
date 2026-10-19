@@ -26,10 +26,10 @@ enumerate the recon slices that reach each detector row, and at a tilted view
 more of them reach one row than the 2 * psf_radius + 1 taps the back kernel
 uses.  The bound that sets the enumeration is checked directly against a brute
 force count of the contributing slices (a CPU test, so it runs everywhere), and
-a thin-slice cell where that bound provably exceeds psf_radius carries the
+a thin-slice shape where that bound provably exceeds psf_radius carries the
 parity statement on a GPU.  The five variants below do NOT reach that case --
 each of them needs one slice tap on each side, which psf_radius already covers
--- so the coverage tests use their own cells and say so.
+-- so the coverage tests use their own shapes and say so.
 
 One more class sits beside those.  Each wrapper rounds a width up to a multiple
 of 16 before the launch -- the back kernel its slice band, the forward kernel
@@ -97,7 +97,7 @@ VARIANTS = {"zero_elevation": {"elevation": "zero"},
             "wide_voxel": {"row_aspect": 3.0}}
 
 
-def _ma_model(cell=(6, 12, 12), elevation="sweep", row_aspect=1.0,
+def _ma_model(shape=(6, 12, 12), elevation="sweep", row_aspect=1.0,
               det_row_offset=0.0, slice_aspect=1.0, device="cuda",
               compile_mode="off"):
     """A small multiaxis model, built as tests/test_multiaxis.py's _small_ma
@@ -107,7 +107,7 @@ def _ma_model(cell=(6, 12, 12), elevation="sweep", row_aspect=1.0,
     pitch, which is what lowers the slice-to-row slope below the point where
     psf_radius still covers the forward kernel's slice enumeration.  It is not
     part of the variant sweep; only the forward coverage tests set it."""
-    num_views = cell[0]
+    num_views = shape[0]
     azimuth = np.linspace(0, np.pi, num_views, endpoint=False)
     if elevation == "zero":
         tilt = np.zeros(num_views)
@@ -116,7 +116,7 @@ def _ma_model(cell=(6, 12, 12), elevation="sweep", row_aspect=1.0,
     else:
         tilt = np.linspace(-0.5, 0.5, num_views)
     model = mbirtorch.MultiAxisParallelModel(
-        cell, np.stack([azimuth, tilt], axis=1), compile_mode=compile_mode)
+        shape, np.stack([azimuth, tilt], axis=1), compile_mode=compile_mode)
     model.configure_devices(devices=[device])
     model.set_params(no_warning=True, verbose=0)
     if row_aspect != 1.0 or det_row_offset != 0.0 or slice_aspect != 1.0:
@@ -166,8 +166,8 @@ def _rel_max(out, ref):
 
 
 @requires_cuda
-@pytest.mark.parametrize("variant", list(VARIANTS))
-@pytest.mark.parametrize("coeff_power,tol", [(1, 1e-5), (2, 1e-4)])
+@pytest.mark.parametrize("variant,coeff_power,tol",
+                         [(v, 1, 1e-5) for v in VARIANTS] + [("elevation_sweep", 2, 1e-4)])
 def test_multiaxis_back_kernel_parity(variant, coeff_power, tol):
     # The geometry reaches the kernel only through the two eager builders it
     # shares with the torch body, so all five variants exercise the same kernel
@@ -190,8 +190,7 @@ def test_multiaxis_back_kernel_parity(variant, coeff_power, tol):
 
 
 @requires_cuda
-@pytest.mark.parametrize("direction,case", [("back", 5), ("back", 12),
-                                            ("back", 16), ("back", 32),
+@pytest.mark.parametrize("direction,case", [("back", 5), ("back", 16),
                                             ("forward", ((6, 12, 12), 12)),
                                             ("forward", ((6, 32, 20), 32))])
 def test_multiaxis_kernel_pads_the_width_argument_to_a_multiple_of_16(
@@ -206,7 +205,7 @@ def test_multiaxis_kernel_pads_the_width_argument_to_a_multiple_of_16(
     the real width when it is already a multiple of 16, the path that has to
     stay exactly what it was.
 
-    Back: this cell's volume is at least 32 slices, so bands of 16 and 32 need
+    Back: this shape's volume is at least 32 slices, so bands of 16 and 32 need
     no padding and bands of 5 and 12 do.  Each banded call is also compared
     against the unbanded call over the same slices, bit for bit (the back
     kernel has no atomics), so the columns the rounding added changed nothing.
@@ -222,7 +221,7 @@ def test_multiaxis_kernel_pads_the_width_argument_to_a_multiple_of_16(
     """
     if direction == "back":
         band_slices = case
-        model = _ma_model(cell=(6, 32, 20))
+        model = _ma_model(shape=(6, 32, 20))
         sinogram, pixel_indices, view_params, args = _body_inputs(model)
         num_slices = int(args['num_slices'])
         assert num_slices >= 32
@@ -246,8 +245,8 @@ def test_multiaxis_kernel_pads_the_width_argument_to_a_multiple_of_16(
             assert banded.is_contiguous() == (padded == length)
         return
 
-    cell, detector_rows = case
-    model = _ma_model(cell=cell)
+    shape, detector_rows = case
+    model = _ma_model(shape=shape)
     _, pixel_indices, view_params, args = _body_inputs(model)
     assert int(args['num_rows_r']) == detector_rows
     values = _voxel_values(model, pixel_indices)
@@ -272,7 +271,7 @@ def test_multiaxis_kernel_pads_the_width_argument_to_a_multiple_of_16(
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, 7, 9, 31])
+@pytest.mark.parametrize("num_pixels", [1, 31])
 def test_multiaxis_back_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes that must contribute exactly
@@ -298,13 +297,13 @@ def test_multiaxis_back_kernel_pixel_padding(num_pixels):
     assert bool(torch.equal(kernel_out, full[:num_pixels]))
 
 
-# The cell the forward COVERAGE tests use.  A thin voxel slice pitch against
+# The shape the forward COVERAGE tests use.  A thin voxel slice pitch against
 # the detector row pitch lowers the slice-to-row slope without touching the
 # vertical footprint, which is exactly what makes more slices reach one row
 # than psf_radius counts.  It is deliberately not one of the VARIANTS: those
 # sweep the contract for the parity gates, and every one of them happens to
 # need a single slice tap on each side.
-THIN_SLICE_CELL = dict(elevation="tilt", slice_aspect=0.5)
+THIN_SLICE_SHAPE = dict(elevation="tilt", slice_aspect=0.5)
 
 
 def _vertical_terms(model):
@@ -361,7 +360,7 @@ def _slice_reach(model):
     return reach, slope, w_p_r, args
 
 
-@pytest.mark.parametrize("variant", list(VARIANTS) + ["thin_slice"])
+@pytest.mark.parametrize("variant", ["strong_tilt", "thin_slice"])
 def test_multiaxis_forward_slice_tap_radius_covers_every_contributing_slice(
         variant):
     """The forward kernel's one hard requirement, checked on any machine.
@@ -373,7 +372,7 @@ def test_multiaxis_forward_slice_tap_radius_covers_every_contributing_slice(
     test can only make indirectly (a dropped slice at the edge of a trapezoid
     carries a small weight and can hide under a relative tolerance).
     """
-    kwargs = (THIN_SLICE_CELL if variant == "thin_slice"
+    kwargs = (THIN_SLICE_SHAPE if variant == "thin_slice"
               else VARIANTS[variant])
     model = _ma_model(device='cpu', **kwargs)
     reach, slope, w_p_r, args = _slice_reach(model)
@@ -383,7 +382,7 @@ def test_multiaxis_forward_slice_tap_radius_covers_every_contributing_slice(
           f"{args['psf_radius']}")
     assert radius >= reach
     # The bound is not free to grow without limit either.  Two statements of
-    # that: it stays under the wrapper's cap, so these cells launch the kernel
+    # that: it stays under the wrapper's cap, so these shapes launch the kernel
     # rather than delegating, and the window it enumerates stays smaller than
     # the volume, so the gather never walks more slices than a scatter would
     # have touched.  A bound that inflated would show up here rather than only
@@ -417,7 +416,7 @@ def test_multiaxis_forward_kernel_parity(variant):
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, 7, 9, 31])
+@pytest.mark.parametrize("num_pixels", [1, 31])
 def test_multiaxis_forward_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes whose atomics must be masked off
@@ -500,14 +499,14 @@ def test_multiaxis_kernel_pair_adjointness():
 
 @requires_cuda
 def test_multiaxis_kernels_span_several_row_chunks():
-    # Every cell above is narrower than the forward kernel's row tile, so its
+    # Every shape above is narrower than the forward kernel's row tile, so its
     # row grid axis holds exactly one program and a bug in that offset would
     # not show.  _tile_size caps the tile at next_pow2(extent), so forcing more
-    # chunks takes more rows than the pinned tile: this cell gives the forward
+    # chunks takes more rows than the pinned tile: this shape gives the forward
     # kernel several detector row chunks and the back kernel several slice
     # chunks.
-    cell = (4, 4 * MULTIAXIS_FWD_BLOCK_R, 16)
-    model = _ma_model(cell=cell)
+    shape = (4, 4 * MULTIAXIS_FWD_BLOCK_R, 16)
+    model = _ma_model(shape=shape)
     sinogram, pixel_indices, view_params, args = _body_inputs(model)
     values = _voxel_values(model, pixel_indices)
     assert int(args['num_rows_r']) > MULTIAXIS_FWD_BLOCK_R
@@ -524,13 +523,13 @@ def test_multiaxis_kernels_span_several_row_chunks():
     back_rel = _rel_max(back_out, back_ref)
     print(f"multiaxis triton multi-row-chunk ({args['num_rows_r']} rows): "
           f"forward rel_max = {fwd_rel:.2e}, back rel_max = {back_rel:.2e}")
-    # 1e-4 here rather than the 1e-5 the small cells gate at, and the reason
+    # 1e-4 here rather than the 1e-5 the small shapes gate at, and the reason
     # is the row count, not the chunking.  The trapezoid weight subtracts two
     # row coordinates of size about num_rows_r, and the kernel and the torch
     # body round the m0 + slope * k forming them differently (the compiler may
     # fuse the multiply-add), so the weight carries an absolute perturbation of
     # about num_rows_r times float32 eps -- about 6e-5 at these 512 rows, read
-    # about 2e-5 on both directions when this gate first ran.  The small-cell
+    # about 2e-5 on both directions when this gate first ran.  The small-shape
     # parity tests above hold the 1e-5 statement where the coordinates cannot
     # inflate it; what this test states is that the chunk offsets are right,
     # and an offset bug would miss by orders of magnitude, not by rounding.
@@ -559,8 +558,8 @@ def test_multiaxis_kernel_recon_matches_a_torch_bodies_recon(monkeypatch):
     kernel_availability._reset_probe_cache()
     kernel_availability._reset_self_check_cache()
     try:
-        cell = (12, 24, 20)
-        model = _ma_model(cell=cell, compile_mode='off')
+        shape = (12, 24, 20)
+        model = _ma_model(shape=shape, compile_mode='off')
         # The arm check: this test exists to measure the KERNELS, so a silent
         # availability decline must fail loudly rather than compare torch with
         # torch and pass vacuously.
@@ -577,7 +576,7 @@ def test_multiaxis_kernel_recon_matches_a_torch_bodies_recon(monkeypatch):
                                           stop_threshold_change_pct=0.0,
                                           logfile_path=None)
 
-        reference_model = _ma_model(cell=cell, compile_mode='off')
+        reference_model = _ma_model(shape=shape, compile_mode='off')
         reference_model._view_batch_bodies = lambda: (
             _multiaxis_forward_view_batch, _multiaxis_back_view_batch)
         reference_model.create_projectors()

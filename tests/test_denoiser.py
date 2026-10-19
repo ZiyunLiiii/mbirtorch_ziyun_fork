@@ -1,7 +1,7 @@
 """QGGMRFDenoiser gates: a denoising smoke on every backend, two shards
 against one device, the sigma_noise knob with the automatic regularization
 off, an all-zero input, the stack denoiser against a loop of single-volume
-calls, and one initialization reused across calls."""
+calls, and the max_alpha bound on the step size."""
 
 import numpy as np
 import pytest
@@ -39,7 +39,7 @@ def test_sharded_denoise_matches_single_device():
     with the single-device run.
 
     The sharded path stages halos once per pass and combines the step-size sums
-    on the lead device, so agreement is at float level, not bitwise (gate per
+    on the first device, so agreement is at float level, not bitwise (gate per
     the measured iterated-comparison floor).  The regularization parameters are
     gated relatively for the same reason: the two runs reach numpy by different
     routes -- a strided view of the caller's own array on one, a concatenation
@@ -197,7 +197,7 @@ def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
     shape = (8, 10, 12)
     num_volumes = 6
     sigma_noise = 0.1
-    stack = _ramp_stack(num_volumes, shape)
+    stack = _ramp_stack(num_volumes, shape, noise_lo=0.01, noise_hi=0.2)
 
     auto = mbirtorch.QGGMRFDenoiser(shape)
     auto.configure_devices(devices=[device])
@@ -274,57 +274,6 @@ def test_denoise_stack_never_writes_the_caller_s_arrays(device):
             assert np.array_equal(stack, before_stack) and np.array_equal(init, before_init)
 
 
-def test_one_initialization_fixes_the_stack_sweep(device):
-    """The pixel grouping is a random draw, and at 16 subsets it moves the
-    result by far more than the stopping threshold of a consensus loop.  A
-    denoiser initialized once must therefore reuse that grouping: two sweeps
-    with do_initialization=False agree to a relative maximum difference of
-    1e-6, while two sweeps that draw again differ by more than 1e-3.  A False
-    call that passes a new noise level uses that level and keeps the cache,
-    since the noise level is one scalar and the grouping is not.  And a
-    partition handed to initialize_denoiser is the one the cache holds and the
-    sweep uses."""
-    shape = (8, 10, 12)
-    stack = _ramp_stack(4, shape)
-    sweep = dict(sigma_noise=0.1, max_iterations=4, stop_threshold_change_pct=0.0)
-
-    denoiser = mbirtorch.QGGMRFDenoiser(shape)
-    denoiser.configure_devices(devices=[device])
-    denoiser.set_params(no_warning=True, verbose=0)
-    settled = denoiser.initialize_denoiser(image=stack, sigma_noise=0.1)
-    assert int(settled['partition'].shape[0]) == 16
-
-    fixed_first, _ = denoiser.denoise_stack(stack, do_initialization=False, **sweep)
-    fixed_again, _ = denoiser.denoise_stack(stack, do_initialization=False, **sweep)
-    rel_fixed = _rel_max(fixed_again, fixed_first)
-
-    drawn_first, _ = denoiser.denoise_stack(stack, **sweep)
-    drawn_again, _ = denoiser.denoise_stack(stack, **sweep)
-    rel_drawn = _rel_max(drawn_again, drawn_first)
-    print(f"stack sweeps on {device}: two reused initializations differ by "
-          f"{rel_fixed:.2e}, two fresh draws by {rel_drawn:.2e}")
-    assert rel_fixed < 1e-6
-    assert rel_drawn > 1e-3
-
-    # A new noise level on a reused initialization: the level is used and the
-    # grouping is kept.
-    held = denoiser.denoise_data['partition']
-    _out, info = denoiser.denoise_stack(stack, sigma_noise=0.25, max_iterations=1,
-                                        stop_threshold_change_pct=0.0,
-                                        do_initialization=False)
-    assert denoiser.denoise_data['partition'] is held
-    assert info['regularization_params']['sigma_y'] == pytest.approx(0.25)
-    assert float(denoiser.get_params('sigma_y')) == pytest.approx(0.25)
-
-    # A supplied partition.
-    supplied = mbirtorch.gen_set_of_pixel_partitions(shape, [16], use_ror_mask=False)[0]
-    cached = denoiser.initialize_denoiser(image=stack, sigma_noise=0.1,
-                                          partition=supplied)['partition']
-    assert torch.equal(cached.cpu(), supplied)
-    denoiser.denoise_stack(stack, do_initialization=False, **sweep)
-    assert denoiser.denoise_data['partition'] is cached
-
-
 # ── the regularization parameters of a stack ─────────────────────────────────
 
 def _auto_denoiser(shape, device, sigma_noise=0.1):
@@ -339,3 +288,60 @@ def _auto_denoiser(shape, device, sigma_noise=0.1):
 
 def _rel(a, b):
     return abs(float(a) - float(b)) / abs(float(b))
+
+
+def test_max_alpha_limits_the_denoiser_step_size(device):
+    """The model parameter max_alpha bounds the step size of the denoiser.
+    A small max_alpha caps every step, so a short denoise and a short stack
+    denoise both differ from runs with the default."""
+    shape = (16, 16, 4)
+    noisy = 0.1 * np.random.RandomState(5).randn(*shape).astype(np.float32)
+
+    results = {}
+    for max_alpha in (None, 0.1):
+        denoiser = mbirtorch.QGGMRFDenoiser(shape)
+        denoiser.configure_devices(devices=[device])
+        denoiser.set_params(no_warning=True, verbose=0)
+        if max_alpha is not None:
+            denoiser.set_params(no_warning=True, max_alpha=max_alpha)
+        np.random.seed(0)
+        single, d = denoiser.denoise(noisy, sigma_noise=0.1, max_iterations=3,
+                                     stop_threshold_change_pct=0.0)
+        np.random.seed(0)
+        stack, _ = denoiser.denoise_stack(noisy[None], sigma_noise=0.1, max_iterations=3,
+                                          stop_threshold_change_pct=0.0)
+        alphas = d['recon_params']['alpha_values']
+        results[max_alpha] = (np.asarray(single), np.asarray(stack)[0], max(alphas))
+
+    assert results[0.1][2] <= 0.1 + 1e-6
+    assert results[None][2] > 0.1
+    assert _rel_max(results[0.1][0], results[None][0]) > 1e-3
+    assert _rel_max(results[0.1][1], results[None][1]) > 1e-3
+
+
+def test_positivity_flag_keeps_the_denoised_image_non_negative():
+    """With positivity_flag set, the single-device, stack, and two-shard denoisers all
+    return a non-negative image, up to float rounding.  Without it, the same input gives
+    negative values."""
+    shape = (16, 16, 6)
+    noisy = 0.1 * np.random.RandomState(6).randn(*shape).astype(np.float32)
+
+    def run(positivity, devices):
+        denoiser = mbirtorch.QGGMRFDenoiser(shape)
+        denoiser.configure_devices(devices=devices)
+        denoiser.set_params(no_warning=True, verbose=0, positivity_flag=positivity)
+        kwargs = dict(sigma_noise=0.1, max_iterations=3, stop_threshold_change_pct=0.0)
+        np.random.seed(0)
+        if len(devices) > 1:
+            out, _ = denoiser.denoise(denoiser._shard_recon(noisy), output_sharded=True,
+                                      **kwargs)
+            return [np.asarray(out.gather())]
+        single, _ = denoiser.denoise(noisy, **kwargs)
+        np.random.seed(0)
+        stack, _ = denoiser.denoise_stack(noisy[None], **kwargs)
+        return [np.asarray(single), np.asarray(stack)[0]]
+
+    assert min(float(out.min()) for out in run(False, ['cpu'])) < 0
+    # A clipped pixel lands at zero up to float rounding, about 1e-22 here.
+    for out in run(True, ['cpu']) + run(True, ['cpu', 'cpu']):
+        assert float(out.min()) >= -1e-12

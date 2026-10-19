@@ -75,6 +75,7 @@ docs = [
 
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "performance: timing-gate tests; exclude with -m 'not performance' on loaded machines",
 ]
@@ -90,6 +91,10 @@ version = {attr = "mbirtorch.__version__"}
 # defaults to namespaces=true, which would sweep __init__.py-less top-level dirs into the
 # wheel).
 find = {include = ["mbirtorch*"]}
+
+[tool.setuptools.package-data]
+# The measured GPU speeds that mbirtorch.estimate_resources reads.
+mbirtorch = ["data/*.json"]
 
 [project.urls]
 source = "https://github.com/cabouman/mbirtorch"

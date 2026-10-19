@@ -1,27 +1,9 @@
-"""TranslationModel: each view is a
-cone beam projection of a translated object (translation computed tomography,
-TCT).  Useful for 3D imaging of thin objects.
+"""This module defines ``TranslationModel`` for translation computed tomography (TCT).  In
+this geometry, each view is a cone beam projection of the object after a translation.  The
+model is useful for 3D imaging of thin objects.
 
-Structure: like cone, translation projection is two separable fans, and the
-bodies below mirror cone_beam.py's.  The view parameter is a per-view
-(t_x, t_y, t_z) object translation instead of a rotation angle: the in-plane
-pixel coordinates are shifted, never rotated, and t_z plays the role cone's
-helical z shift plays in the vertical fan.  The HORIZONTAL fan maps a voxel
-to detector channels with per-pixel magnification; the VERTICAL fan maps
-each slice of a voxel cylinder to a range of detector rows through the
-affine pair (m0, W_p_r) of :func:`_translation_vertical_affine`.  Both
-directions use the single psf_radius of :meth:`TranslationModel.get_psf_radius`
-(translation has no separate forward vertical radius).
-
-Known scale limit: at production TCT detector shapes
-(~1900x3000 panels) the back projection holds (view_batch, P, rows) and
-(view_batch, P, slices) transients, so large pixel batches are memory-bound
-and the view batch shrinks accordingly.  What would relieve it is a change
-to the projector drivers, not to this file: they currently tile over views
-only, and tiling over the pixel axis as well -- the two-axis tiling
-described in projectors.py -- would let the pixel batch shrink instead of the
-view batch.  Nothing here
-works around its absence.
+The projectors use two separable fans, as in the cone beam model.  Each view has an object
+translation (t_x, t_y, t_z) in place of a rotation.  Both fans use the same psf radius.
 """
 
 import warnings
@@ -29,6 +11,7 @@ import warnings
 import numpy as np
 import torch
 
+from . import _sharding, tomography_utils
 from .cone_beam import (ConeBeamModel, _cone_channel_coordinate,
                         _cone_row_coordinate)
 from .geometry_rules import channel_index, pixel_xy, row_index
@@ -41,10 +24,9 @@ _F32 = torch.float32
 def _translation_pixel_xy_mag(pixel_indices, t_x, t_y, num_rows, num_cols,
                               delta_voxel, delta_voxel_row, magnification,
                               source_detector_dist):
-    """Translated in-plane coordinates and the per-pixel magnification.
-
-    The object shifts by (-t_x, -t_y) per view and is never rotated.
-    Returns x (Vb, P), y (Vb, P), and pixel_mag (Vb, P).
+    """This function returns the in-plane coordinates x and y of each pixel.  For each view, it
+    shifts the coordinates by (-t_x, -t_y).  It also returns the magnification of each pixel.  Each output
+    has shape (Vb, P), where Vb is the number of views in the batch and P is the number of pixels.
     """
     x_tilde, y_tilde = pixel_xy(pixel_indices, num_rows, num_cols, delta_voxel,
                                 delta_voxel_row)
@@ -54,8 +36,9 @@ def _translation_pixel_xy_mag(pixel_indices, t_x, t_y, num_rows, num_cols,
 
 def _translation_xy_mag(x_tilde, y_tilde, t_x, t_y, magnification,
                         source_detector_dist):
-    """The same map as :func:`_translation_pixel_xy_mag`, taking positions
-    rather than pixel indices.  Returns x, y, and pixel_mag, each (Vb, P)."""
+    """This function computes the same values as :func:`_translation_pixel_xy_mag`, but it
+    takes positions in place of pixel indices.  It returns x, y, and pixel_mag, each of shape
+    (Vb, P)."""
     y = y_tilde[None, :] - t_y[:, None]
     x = x_tilde[None, :] - t_x[:, None]
     pixel_mag = 1.0 / (1.0 / magnification - y / source_detector_dist)
@@ -67,11 +50,8 @@ def _translation_horizontal_data(pixel_indices, view_params_batch, num_rows,
                                  delta_voxel_row, delta_det_channel,
                                  det_channel_offset, magnification,
                                  source_detector_dist):
-    """The horizontal fan inputs for one view batch.
-
-    Returns n_p, centers (int32), W_p_c, and weight_scale, each (Vb, P), plus
-    pixel_mag for the vertical fan.  The weight scale is the projection length
-    through a voxel, delta_voxel_row / cos(theta_p).
+    """This function computes the values that the horizontal fan projector needs for one batch
+    of views.  It returns n_p, centers, W_p_c, weight_scale, and pixel_mag.  Each has shape (Vb, P).
     """
     t_x = view_params_batch[:, 0]
     t_y = view_params_batch[:, 1]
@@ -91,10 +71,9 @@ def _translation_horizontal_data(pixel_indices, view_params_batch, num_rows,
 
 def _translation_vertical_affine(pixel_mag, t_z, num_slices, delta_voxel_slice,
                                  delta_det_row, det_row_offset, num_rows_r):
-    """The vertical fan's affine map from global slice index to detector row.
-
-    The map is m(v, p, l) = m0 + W_p_r * l.  Returns m0 (Vb, P), W_p_r (Vb, P),
-    and z_offset (Vb,).
+    """This function returns the affine map m = m0 + W_p_r * l of the vertical fan.  The map
+    takes a slice index l of the full volume to a detector row m.  The function returns m0
+    (Vb, P), W_p_r (Vb, P), and z_offset (Vb,).
     """
     z_offset = -t_z                                              # (Vb,)
     W_p_r = pixel_mag * delta_voxel_slice / delta_det_row        # (Vb, P)
@@ -112,11 +91,9 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
                                     det_channel_offset, det_row_offset,
                                     magnification, source_detector_dist,
                                     psf_radius, slice_start=0, plan=None):
-    """Translation forward projection for one view batch.  Returns (Vb, R, C).
-
-    ``values`` may be a slice band (P, L) with global indices starting at
-    ``slice_start``.  The z geometry stays anchored on the full num_slices
-    center, and taps outside the band contribute zero.  ``plan`` is ignored.
+    """This function returns the forward projection of one batch of views.  The output has shape
+    (Vb, R, C).  The array ``values`` has shape (P, L).  It may hold only a contiguous block of
+    L slices that starts at ``slice_start``.  This function does not use ``plan``.
     """
     n_p, centers, W_p_c, weight_scale, pixel_mag = _translation_horizontal_data(
         pixel_indices, view_params_batch, num_recon_rows, num_recon_cols,
@@ -126,12 +103,11 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
     dev = values.device
     t_z = view_params_batch[:, 2]
 
-    # Vertical fan, detector side.
     m0, W_p_r, z_offset = _translation_vertical_affine(
         pixel_mag, t_z, num_slices, delta_voxel_slice, delta_det_row,
         det_row_offset, num_rows_r)
 
-    # 1/cos(phi) is the projection length through a voxel at cone angle phi.
+    # 1/cos(phi) is the path length through a voxel at cone angle phi.
     band_len = values.shape[1]
     k = torch.arange(slice_start, slice_start + band_len, dtype=_F32, device=dev)
     z = (delta_voxel_slice * (k - (num_slices - 1) / 2.0))[None, None, :] \
@@ -141,8 +117,7 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
         source_detector_dist, dtype=_F32, device=dev)))
     scaled_values = values[None, :, :] / cos_phi
 
-    # This is the inverse of the affine map, from detector rows to fractional
-    # slice indices.  The back projection body evaluates the direct form.
+    # The inverse of the affine map takes each detector row to a fractional slice index.
     m = torch.arange(num_rows_r, dtype=_F32, device=dev)         # (R,)
     k_m = (m[None, None, :] - m0.unsqueeze(-1)) / W_p_r.unsqueeze(-1)
     k_center = torch.round(k_m).to(torch.int64)                  # (Vb, P, R)
@@ -176,9 +151,10 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                                  magnification, source_detector_dist,
                                  psf_radius, coeff_power=1, slice_start=0,
                                  band_slices=None, plan=None):
-    """Translation back projection for one view batch, summed over its views.
-
-    Returns (P, S), or (P, band_slices) for a slice band.  ``plan`` is ignored.
+    """This function computes the back projection of one batch of views.  It sums the back
+    projections of the individual views.  The output has shape (P, S), or (P, band_slices) when
+    ``band_slices`` is given.
+    This function does not use ``plan``.
     """
     n_p, centers, W_p_c, weight_scale, pixel_mag = _translation_horizontal_data(
         pixel_indices, view_params_batch, num_recon_rows, num_recon_cols,
@@ -188,13 +164,11 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     dev = sino_batch.device
     t_z = view_params_batch[:, 2]
 
-    # Horizontal fan gather, with the view axis kept.
     sino_T = sino_batch.permute(0, 2, 1).contiguous()            # (Vb, C, R)
     det_col = fan_back_batch(sino_T, (n_p, centers, W_p_c, weight_scale),
                              num_channels, psf_radius,
                              coeff_power=coeff_power, reduce_views=False)
 
-    # Vertical fan gather.
     m0, W_p_r, z_offset = _translation_vertical_affine(
         pixel_mag, t_z, num_slices, delta_voxel_slice, delta_det_row,
         det_row_offset, num_rows_r)
@@ -206,7 +180,6 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     v_slices = pixel_mag.unsqueeze(-1) * z                       # (Vb, P, S)
     sdd_t = torch.as_tensor(source_detector_dist, dtype=_F32, device=dev)
     cos_phi = torch.cos(torch.atan2(v_slices, sdd_t))
-    # This is the direct form of the affine map, from slice to detector row.
     slope = W_p_r.unsqueeze(-1)
     m_p = m0.unsqueeze(-1) + slope * k[None, None, :]            # (Vb, P, S)
     m_center = torch.round(m_p).to(torch.int64)
@@ -225,32 +198,45 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     return out
 
 
+def _find_obj_positions(translation_vectors, axis):
+    """This function finds the distinct object positions along one axis.
+
+    ``axis`` is 'x', 'y', or 'z'.  The translations recorded at one position differ by small
+    position errors, and the positions are separated by gaps that are much larger than those
+    errors.  The function groups the translations with :func:`utilities._cluster_1d`.  Each
+    position is the mean of its translations.  The function returns the positions in increasing
+    order and the position index of each view, with shape (num_views,).
+    """
+    from .utilities import _cluster_1d
+    if axis not in ('x', 'y', 'z'):
+        raise ValueError(f"axis must be 'x', 'y', or 'z'; got {axis!r}.")
+    translations = np.asarray(translation_vectors)[:, 'xyz'.index(axis)]
+    return _cluster_1d(translations)
+
+
 class TranslationModel(TomographyModel):
     """
-    A class for forward and backward projections in a translation (TCT)
-    geometry, extending :class:`TomographyModel`: each view is a cone beam
-    projection of a translated object.  Useful for 3D imaging of thin objects.
+    This class is used to compute forward and back projections in the translation (TCT)
+    geometry.  The class extends :class:`TomographyModel`.  In this geometry, each view is a
+    cone beam projection of the object after a translation.  The class is useful for 3D
+    imaging of thin objects.
 
     Args:
-        sinogram_shape (tuple): (num_views, num_det_rows, num_det_channels),
-            where num_views is the number of translation steps.
-        translation_vectors (ndarray): (num_views, 3) array of object
-            translations (x, y, z) in ALU.  Each view moves the object by minus
-            its vector, in the object frame that
-            ``project_points`` describes: a
-            positive t_x moves the object toward -x, so its image moves toward
-            lower channel index; a positive t_y moves it toward -y, away from
-            the source, so its image shrinks toward the point where the central
-            ray meets the detector; a positive t_z moves it toward -z, so its
-            image moves toward lower row index.
-        source_detector_dist (float): Distance from source to detector in ALU.
-        source_iso_dist (float): Distance from source to isocenter in ALU.
-        view_batch_size, compile_mode: as in ParallelBeamModel.
+        sinogram_shape (tuple): (num_views, num_det_rows, num_det_channels).  num_views is
+            the number of translation steps.
+        translation_vectors (ndarray): A (num_views, 3) array of object translations
+            (t_x, t_y, t_z) in ALU.  In each view, the object moves by the negative of the
+            translation vector of that view.  A positive t_x moves the image toward a lower
+            channel index.  A positive t_y moves the object away from the source.  A positive
+            t_z moves the image toward a lower row index.
+        source_detector_dist (float): The distance from the source to the detector in ALU.
+        source_iso_dist (float): The distance from the source to the isocenter in ALU.
+        view_batch_size: The same as in ``ParallelBeamModel``.
+        compile_mode: The same as in ``ParallelBeamModel``.
     """
 
-    # The thresholds for this family are the translation rows of
-    # _widening_floors.FLOORS.
-    _floor_family = 'translation'
+    # This name selects the translation table in ``_min_problem_sizes``, which lists minimum sinogram sizes.
+    _size_table_key = 'translation'
 
     def __init__(self, sinogram_shape, translation_vectors, source_detector_dist,
                  source_iso_dist, view_batch_size=None, compile_mode='auto'):
@@ -258,8 +244,8 @@ class TranslationModel(TomographyModel):
         if translation_vectors.ndim != 2 or translation_vectors.shape[1] != 3:
             raise ValueError('translation_vectors must have shape '
                              f'(num_views, 3); got {translation_vectors.shape}.')
-        # Row neighbor regularization is weak because the objects are thin.  There is
-        # no cylindrical mask because the object usually spans the field of view.
+        # The row neighbor weight is small because the objects are thin.  The model uses no
+        # cylindrical mask because the object usually spans the field of view.
         super().__init__(sinogram_shape,
                          view_batch_size=view_batch_size, compile_mode=compile_mode,
                          geometry_type='translation',
@@ -268,16 +254,14 @@ class TranslationModel(TomographyModel):
                          source_detector_dist=source_detector_dist,
                          source_iso_dist=source_iso_dist,
                          qggmrf_nbr_wts=[0.1, 1.0, 1.0], use_ror_mask=False)
-        # A larger line search cap has shown instabilities in this geometry.
+        # A larger max_alpha has made reconstructions unstable in this geometry.
         self.set_params(no_warning=True, max_alpha=1.3)
 
     def _view_batch_bodies(self):
-        # Translation has no hand written kernels, only the compiled torch bodies.
         return _translation_forward_view_batch, _translation_back_view_batch
 
     def _project_points_batch(self, points, view_params):
-        # points is (N, 3) float64 on the CPU.  view_params is (V, 3) holding
-        # (t_x, t_y, t_z).  Returns (row, channel), each (V, N).
+        # points is (N, 3) float64 on the CPU.  view_params is (V, 3) and holds (t_x, t_y, t_z).
         ddr, ddc, dro, dco, sdd = self.get_params(
             ['delta_det_row', 'delta_det_channel', 'det_row_offset',
              'det_channel_offset', 'source_detector_dist'])
@@ -311,14 +295,13 @@ class TranslationModel(TomographyModel):
                     psf_radius=self.get_psf_radius())
 
     def _transient_cols(self, band_cols):
-        # The bodies hold (Vb, P, S) and (Vb, P, R) temporaries whatever band is
-        # requested, so the budget width comes from the parameters.
+        # The projector functions hold (Vb, P, S) and (Vb, P, R) temporary arrays for any requested block of slices.
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
                                                        'recon_shape'])
         return max(int(recon_shape[2]), int(sinogram_shape[1]))
 
     def get_magnification(self):
-        """magnification = source_detector_dist / source_iso_dist."""
+        """This method returns the magnification, which is source_detector_dist / source_iso_dist."""
         source_detector_dist, source_iso_dist = self.get_params(
             ['source_detector_dist', 'source_iso_dist'])
         if np.isinf(source_detector_dist):
@@ -328,7 +311,7 @@ class TranslationModel(TomographyModel):
         return source_detector_dist / source_iso_dist
 
     def verify_valid_params(self):
-        """Check that all parameters are compatible for a reconstruction."""
+        """This method checks that all parameters are compatible for a reconstruction."""
         super().verify_valid_params()
         sinogram_shape, translation_vectors = self.get_params(
             ['sinogram_shape', 'translation_vectors'])
@@ -343,16 +326,15 @@ class TranslationModel(TomographyModel):
             raise ValueError('Voxel aspect ratios must be positive.')
 
     def get_psf_radius(self):
-        """Integer radius of the psf kernel, from the maximum magnification
-        over the translated positions (used by both fans; translation has no
-        separate forward vertical radius)."""
+        """This method returns the integer radius of the psf kernel.  It computes the radius
+        from the largest magnification over all translated positions."""
         (delta_det_row, delta_det_channel, source_iso_dist, source_detector_dist,
          recon_shape, delta_voxel, translation_vectors, voxel_row_aspect,
          voxel_slice_aspect) = self.get_params(
             ['delta_det_row', 'delta_det_channel', 'source_iso_dist',
              'source_detector_dist', 'recon_shape', 'delta_voxel',
              'translation_vectors', 'voxel_row_aspect', 'voxel_slice_aspect'])
-        magnification = self.get_magnification()   # Raises at infinite SDD.
+        magnification = self.get_magnification()   # Raises an error when source_detector_dist is infinite.
         delta_voxel_row = voxel_row_aspect * delta_voxel
         delta_voxel_slice = voxel_slice_aspect * delta_voxel
         delta_det = min(delta_det_row, delta_det_channel)
@@ -375,7 +357,8 @@ class TranslationModel(TomographyModel):
         return psf_radius
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
-        """Compute the automatic recon shape for translation reconstruction."""
+        """This method sets the reconstruction shape and voxel size automatically from the
+        translation geometry."""
         from .utilities import calc_tct_recon_params
         sinogram_shape = self.get_params('sinogram_shape')
         source_detector_dist, source_iso_dist = self.get_params(
@@ -396,81 +379,230 @@ class TranslationModel(TomographyModel):
                         voxel_row_aspect=voxel_row_aspect)
 
     def _check_lateral_truncation(self, sino_indicator):
-        """Do nothing.  In translation tomography the object routinely spans
-        the whole field of view, so sinogram support that touches the edge is
-        normal rather than the defect the base check warns about."""
+        """This method does nothing.  The base class warns when the object touches the edge of
+        the detector.  In translation tomography, the object normally spans the whole field of
+        view, so this warning is not needed."""
         return
 
-    def fdk_filter(self, sinogram, filter_name="ramp", output_sharded=False):
-        """FDK filtering: the shared row filter with the FDK cosine pre-weight
-        per detector element and the voxel-size scale alpha (as in cone;
-        translation reuses cone's detector coordinate map)."""
-        sinogram = self._shard_sinogram(sinogram)
-        _, num_rows, num_channels = (int(x) for x in
-                                     self.get_params('sinogram_shape'))
-        source_detector_dist = self.get_params('source_detector_dist')
-        (delta_voxel, delta_det_row, delta_det_channel, voxel_row_aspect,
-         voxel_slice_aspect) = self.get_params(
-            ['delta_voxel', 'delta_det_row', 'delta_det_channel',
-             'voxel_row_aspect', 'voxel_slice_aspect'])
-        det_row_offset, det_channel_offset = self.get_params(
-            ['det_row_offset', 'det_channel_offset'])
-        voxel_volume = delta_voxel * (voxel_row_aspect * delta_voxel) \
-            * (voxel_slice_aspect * delta_voxel)
-        M_0 = self.get_magnification()
+    def _warn_tct_direct_failed(self):
+        """This method warns that the x translations are not on a regular grid."""
+        warnings.warn('The TCT direct reconstruction failed because the x translations are not '
+                      'on a regular grid.  The result is zeros.', stacklevel=3)
 
-        # The FDK cosine pre-weight is (rows, channels) and does not vary with view.
-        m_grid, n_grid = np.meshgrid(np.arange(num_rows), np.arange(num_channels),
-                                     indexing='ij')
-        u_grid, v_grid = ConeBeamModel.detector_mn_to_uv(
-            m_grid, n_grid, delta_det_channel, delta_det_row,
-            det_channel_offset, det_row_offset, num_rows, num_channels)
-        weight_map = source_detector_dist / np.sqrt(
-            source_detector_dist ** 2 + u_grid ** 2 + v_grid ** 2)
-        weight_t = torch.as_tensor(weight_map.astype(np.float32),
-                                   device=self.torch_device)
-
-        alpha = delta_det_row / (voxel_volume * M_0)
-        return self._apply_direct_recon_filter(sinogram, filter_name,
-                                               filter_scale=alpha,
-                                               output_sharded=output_sharded,
-                                               row_weight=weight_t)
-
-    def recon_fdk(self, sinogram, filter_name="ramp", output_sharded=False):
+    def direct_filter_tct(self, sinogram, filter_name="ramp", output_sharded=False):
         """
-        Perform FDK reconstruction: standard filtering, then the exact adjoint
-        of the forward projector as the backprojection.
+        This method applies the filter of the TCT direct reconstruction to a sinogram.
+
+        Each detector row is extended at each end by half its length with its end value,
+        pre-weighted by the cosine weight, ramp filtered, and cropped back to its length.
+        The result is scaled by a factor that depends on the translation step, the voxel
+        size, and the angles of the ray to each detector pixel.  When the x translations are
+        not on a regular grid, the method warns and returns zeros.
+        """
+        translation_step = self._tct_translation_step()
+        if translation_step is None:
+            self._warn_tct_direct_failed()
+            zeros = np.zeros(self.get_params('sinogram_shape'), dtype=np.float32)
+            return self._shard_sinogram(zeros) if output_sharded else zeros
+        sinogram = self._shard_sinogram(sinogram)
+        # The sinogram can be a Shards container, so the shape comes from the parameters.
+        _, num_rows, num_channels = (int(x) for x in self.get_params('sinogram_shape'))
+        source_detector_dist = self.get_params('source_detector_dist')
+        delta_det_channel, delta_det_row, det_channel_offset, det_row_offset = (
+            self.get_params(['delta_det_channel', 'delta_det_row', 'det_channel_offset',
+                             'det_row_offset']))
+        delta_voxel, voxel_row_aspect, voxel_slice_aspect = self.get_params(
+            ['delta_voxel', 'voxel_row_aspect', 'voxel_slice_aspect'])
+        voxel_volume = delta_voxel ** 3 * voxel_row_aspect * voxel_slice_aspect
+
+        filter_scale = translation_step * delta_det_row / (source_detector_dist * voxel_volume)
+
+        # Each row is extended at each end by half the detector width, preweighted by cosine
+        # weight, ramp filtered, and cropped back to its length.
+        pad = num_channels // 2
+        u, v = ConeBeamModel.detector_mn_to_uv(
+            np.arange(num_rows)[:, None],
+            np.arange(-pad, num_channels + pad)[None, :],
+            delta_det_channel, delta_det_row, det_channel_offset, det_row_offset,
+            num_rows, num_channels)
+        d2 = source_detector_dist ** 2
+        pre_weight = source_detector_dist / np.sqrt(u ** 2 + v ** 2 + d2)
+        u_used = u[:, pad:pad + num_channels]
+        # The back projection multiplies each value by the path length of the ray through a
+        # voxel.  This length is proportional to 1 / (cos(theta) cos(phi)), and the post
+        # weight cancels it.
+        post_weight = (filter_scale * (source_detector_dist / np.sqrt(u_used ** 2 + d2))
+                       * (source_detector_dist / np.sqrt(v ** 2 + d2)))
+        recon_filter = tomography_utils.generate_direct_recon_filter(num_channels + 2 * pad,
+                                                                     filter_name=filter_name)
+
+        def filter_views(sino_t):
+            dev = sino_t.device
+            pre_t = torch.as_tensor(pre_weight.astype(np.float32), device=dev)
+            post_t = torch.as_tensor(post_weight.astype(np.float32), device=dev)
+            filter_t = torch.as_tensor(recon_filter, device=dev)
+            filtered = tomography_utils.apply_row_filter(sino_t, filter_t, row_weight=pre_t,
+                                                         edge_pad=pad)
+            return filtered.mul_(post_t)
+
+        if isinstance(sinogram, _sharding.Shards):
+            filtered = _sharding.Shards(
+                _sharding.run_per_device(self.sino_placement.devices,
+                                         lambda i, d: filter_views(sinogram.tensors[i])),
+                self.sino_placement)
+        else:
+            filtered = filter_views(sinogram)
+        return filtered if output_sharded else self._gather_sinogram(filtered)
+
+    def recon_direct_tct(self, sinogram, filter_name="ramp", output_sharded=False):
+        """
+        This method reconstructs a volume from a sinogram by TCT direct reconstruction algorithm.
+
+        The method first filters the sinogram. It then back projects the result with the exact
+        adjoint of the forward projector. Finally, each reconstructed voxel value is divided by the
+        number of translation rows that record it. A translation row is
+        the set of views that share one z translation.
+
+        Args:
+            sinogram (numpy or tensor): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).
+            filter_name (string, optional): The name of the filter to use.
+                Defaults to 'ramp'.
+            output_sharded (bool, optional): If False, the method returns a numpy array.  If
+                True, the method returns the result on the devices.  This result is a torch
+                tensor for a model on one device, or a Shards container with one tensor per
+                device for a model on several devices.  Defaults to False.
+
+        Returns:
+            recon (numpy or tensor): The reconstructed volume.
 
         Note:
-            Translation tomography is an inherently limited-angle geometry, so
-            this direct reconstruction is only approximate; it is intended as
-            an initializer for the iterative ``recon()``.
+            Translation tomography is a limited angle geometry, so this reconstruction is
+            approximate.  It is intended as an initial value for ``recon()``.  When the x
+            translations are not on a regular grid, the method warns and returns zeros.
         """
-        # The device layout is settled before the first large allocation, so a
-        # bare FDK call spreads across the GPUs instead of landing on one.
+        if self._tct_translation_step() is None:
+            self._warn_tct_direct_failed()
+            zeros = np.zeros(self.get_params('recon_shape'), dtype=np.float32)
+            return self._shard_recon(zeros) if output_sharded else zeros
+        # This call chooses the GPUs and checks memory for a direct reconstruction before any allocation.
         self._apply_device_policy(workload='direct')
-        filtered_sinogram = self.fdk_filter(sinogram, filter_name=filter_name,
-                                            output_sharded=True)
-        recon = self.back_project(filtered_sinogram, output_sharded=True)
+        # The filter places the sinogram on the devices.  This method keeps no reference to the
+        # device sinogram during the back projection.
+        filtered_sinogram = self.direct_filter_tct(sinogram, filter_name=filter_name,
+                                                   output_sharded=True)
+        recon = self._back_project(filtered_sinogram, output_sharded=True)
+        del filtered_sinogram
+
+        # Each voxel is divided by the number of translation rows that record it.  A voxel that
+        # no translation row records has a zero back projection, and it is divided by one
+        # instead of zero.
+        translation_row_count = self._count_translation_rows()
+        inverse_count = (1.0 / np.maximum(translation_row_count, 1.0)).astype(np.float32)
+        if isinstance(recon, _sharding.Shards):
+            num_slices = int(self.get_params('recon_shape')[2])
+            for i, (dev, (s0, s1)) in enumerate(recon.placement.shard_ranges(num_slices)):
+                inverse_count_t = torch.as_tensor(inverse_count[:, s0:s1], device=dev)
+                recon.tensors[i].mul_(inverse_count_t[:, None, :])
+        else:
+            recon.mul_(torch.as_tensor(inverse_count, device=recon.device)[:, None, :])
         return recon if output_sharded else self._gather_recon(recon)
 
     def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
-        """Direct reconstruction by the FDK algorithm; equivalent to
-        :meth:`recon_fdk`.  See :meth:`TomographyModel.recon_direct` for the
-        argument and return conventions."""
-        return self.recon_fdk(sinogram, filter_name=filter_name,
-                              output_sharded=output_sharded)
+        """This method reconstructs a volume by the TCT direct reconstruction algorithm.
+
+        This method is the same as :meth:`recon_direct_tct`.  See
+        :meth:`TomographyModel.recon_direct` for the arguments and return value.
+        """
+        return self.recon_direct_tct(sinogram, filter_name=filter_name,
+                                     output_sharded=output_sharded)
 
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
-        """Filtering as needed for a direct recon; equivalent to
-        :meth:`fdk_filter`."""
-        return self.fdk_filter(sinogram, filter_name=filter_name,
-                               output_sharded=output_sharded)
+        return self.direct_filter_tct(sinogram, filter_name=filter_name,
+                                      output_sharded=output_sharded)
+
+    def recon_fdk(self, sinogram, filter_name="ramp", output_sharded=False):
+        """This method is deprecated.  It warns and then calls :meth:`recon_direct_tct`.
+
+        Earlier releases reconstructed the translation geometry by the FDK algorithm.  The
+        result now differs from that of the earlier releases.
+        """
+        warnings.warn('TranslationModel.recon_fdk is deprecated and will be removed in a future '
+                      'release.  It now returns the TCT direct reconstruction.  Use '
+                      'recon_direct_tct instead.', FutureWarning, stacklevel=2)
+        return self.recon_direct_tct(sinogram, filter_name=filter_name,
+                                     output_sharded=output_sharded)
+
+    def fdk_filter(self, sinogram, filter_name="ramp", output_sharded=False):
+        """This method is deprecated.  It warns and then calls :meth:`direct_filter_tct`."""
+        warnings.warn('TranslationModel.fdk_filter is deprecated and will be removed in a future '
+                      'release.  It now applies the TCT direct filter.  Use direct_filter_tct '
+                      'instead.', FutureWarning, stacklevel=2)
+        return self.direct_filter_tct(sinogram, filter_name=filter_name,
+                                      output_sharded=output_sharded)
+
+    def _tct_translation_step(self):
+        """This method finds the translation step along x.
+
+        The step is the median spacing between neighboring object positions along x, in ALU.
+        The method returns None when the positions are not on a regular grid: there are fewer
+        than two positions, or the spacings differ by more than one voxel.
+        """
+        translation_vectors = np.asarray(self.get_params('translation_vectors'), dtype=np.float64)
+        delta_voxel = self.get_params('delta_voxel')
+        x_positions, _ = _find_obj_positions(translation_vectors, 'x')
+        if len(x_positions) < 2:
+            # For a scan with one translation row, the clustering finds only one x position.
+            # In that case, each view is used as its own x position, unless the views share one
+            # x position.
+            x_positions = np.sort(translation_vectors[:, 0])
+            if len(x_positions) < 2 or np.diff(x_positions).min() <= delta_voxel:
+                return None
+        spacings = np.diff(x_positions)
+        if spacings.max() - spacings.min() > delta_voxel:
+            return None
+        return float(np.median(spacings))
+
+    def _count_translation_rows(self):
+        """This method counts the number of translation rows that record each voxel.
+
+        A translation row records a voxel when the voxel projects onto the detector. The count does
+        not depend on the column position of the voxel, so the method returns an array with shape
+        (num_recon_rows, num_recon_slices). So all voxels with the same row index and slice index
+        are recorded by the same number of translation rows.
+        """
+        num_det_rows = int(self.get_params('sinogram_shape')[1])
+        source_detector_dist = self.get_params('source_detector_dist')
+        delta_det_row, det_row_offset = self.get_params(['delta_det_row', 'det_row_offset'])
+        delta_voxel, voxel_row_aspect, recon_shape = self.get_params(
+            ['delta_voxel', 'voxel_row_aspect', 'recon_shape'])
+        num_recon_rows, _, num_recon_slices = (int(x) for x in recon_shape)
+        translation_vectors = np.asarray(self.get_params('translation_vectors'),
+                                         dtype=np.float64)
+        z_positions, z_position_index = _find_obj_positions(translation_vectors, 'z')
+        # Each translation row has one t_y and one t_z, the means over the views of the row.
+        row_means = np.array([translation_vectors[z_position_index == k].mean(axis=0)
+                              for k in range(len(z_positions))])
+        t_y, t_z = row_means[:, 1], row_means[:, 2]
+
+        # y is the depth of each recon row, and z is the height of each recon slice.
+        y = ((np.arange(num_recon_rows) - (num_recon_rows - 1) / 2) * delta_voxel
+             * voxel_row_aspect)
+        z = self.recon_slice_z()
+        # pixel_mag has shape (number of translation rows, num_recon_rows).  It does not depend
+        # on x, so x is set to zero.
+        _, _, pixel_mag = _translation_xy_mag(np.zeros_like(y), y, np.zeros_like(t_y), t_y,
+                                              self.get_magnification(), source_detector_dist)
+        translation_row_count = np.zeros((num_recon_rows, num_recon_slices))
+        for k in range(len(z_positions)):
+            v = _cone_row_coordinate(pixel_mag[k][:, None], z[None, :] - t_z[k])
+            row = row_index(v, delta_det_row, det_row_offset, num_det_rows)
+            translation_row_count += (row >= -0.5) & (row <= num_det_rows - 0.5)
+        return translation_row_count
 
     def _get_estimate_of_recon_std(self, sinogram, sino_indicator):
-        """Estimate the standard deviation of the reconstruction from the
-        sinogram.  The estimate accounts for the anisotropic row pitch and is
-        used to scale sigma_prox and sigma_x."""
+        """This method estimates the standard deviation of the reconstruction from the
+        sinogram.  The estimate uses the voxel size along the row axis."""
         delta_voxel = self.get_params('delta_voxel')
         recon_shape = self.get_params('recon_shape')
         voxel_row_aspect = self.get_params('voxel_row_aspect')
@@ -478,7 +610,7 @@ class TranslationModel(TomographyModel):
 
         typical_sinogram_value = np.average(np.abs(sinogram),
                                             weights=sino_indicator)
-        # The object is assumed to fill about half the row extent.
+        # The estimate assumes that the object fills about half of the rows.
         fraction_of_fill = 0.5
         typical_path_length = fraction_of_fill * recon_shape[0] * delta_voxel_row
         return typical_sinogram_value / typical_path_length

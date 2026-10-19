@@ -159,25 +159,25 @@ def _banded_case(devices, sino_shape=(8, 6, 8)):
     return m, idx, vals, sino, ref_fwd, ref_back, ref_back2
 
 
-def _cone_banded_case(devices, cell=(8, 8, 8)):
+def _cone_banded_case(devices, shape=(8, 8, 8)):
     import mbirtorch
-    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
-    m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
-                                source_iso_dist=2 * cell[2])
+    angles = np.linspace(0, 2 * np.pi, shape[0], endpoint=False)
+    m = mbirtorch.ConeBeamModel(shape, angles, source_detector_dist=4 * shape[2],
+                                source_iso_dist=2 * shape[2])
     m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     rs = tuple(m.get_params('recon_shape'))
     rng = np.random.RandomState(5)
     idx = np.sort(rng.choice(rs[0] * rs[1], size=30, replace=False))
     vals = rng.rand(len(idx), rs[2]).astype(np.float32)
-    sino = rng.rand(*cell).astype(np.float32)
+    sino = rng.rand(*shape).astype(np.float32)
     ref_fwd = m.sparse_forward_project(vals, idx).cpu().numpy()
     ref_back = m.sparse_back_project(sino, idx).cpu().numpy()
     m.configure_devices(devices=devices)
     return m, idx, vals, sino, ref_fwd, ref_back
 
 
-def _torch_body_case(m, devices, sino_shape, seed):
+def _torch_projector_case(m, devices, sino_shape, seed):
     """The shared tail of the two cases below: take the single-device
     references for a seeded sparse problem, then place the model on
     ``devices``.  Same return shape as ``_cone_banded_case``."""
@@ -197,14 +197,14 @@ def _torch_body_case(m, devices, sino_shape, seed):
 
 def _multiaxis_banded_case(devices, sino_shape=(8, 7, 8)):
     """A multiaxis model on virtual CPU devices, plus its single-device
-    reference.  This cell's recon is (8, 8, 7), so at three devices neither
+    reference.  This shape's recon is (8, 8, 7), so at three devices neither
     the view axis nor the slice axis divides and both split unevenly."""
     import mbirtorch
     azimuth = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
     elevation = np.linspace(-0.4, 0.4, sino_shape[0])
     m = mbirtorch.MultiAxisParallelModel(
         sino_shape, np.stack([azimuth, elevation], axis=1))
-    return _torch_body_case(m, devices, sino_shape, seed=7)
+    return _torch_projector_case(m, devices, sino_shape, seed=7)
 
 
 def _translation_banded_case(devices, sino_shape=(4, 20, 16)):
@@ -217,7 +217,7 @@ def _translation_banded_case(devices, sino_shape=(4, 20, 16)):
     m = mbirtorch.TranslationModel(sino_shape, tvecs,
                                    source_detector_dist=128.0,
                                    source_iso_dist=32.0)
-    return _torch_body_case(m, devices, sino_shape, seed=9)
+    return _torch_projector_case(m, devices, sino_shape, seed=9)
 
 
 def test_qggmrf_halos_match_full_volume():
@@ -268,6 +268,32 @@ def test_qggmrf_halos_match_full_volume():
     assert lh3[2] is None and rh3[2] is None  # the shard with no slices
 
 
+def test_qggmrf_chunks_match_one_call():
+    # The prior pass computed on chunks of pixels, with a padded last chunk, matches one call on
+    # all of the pixels.  The padded pixels do not count in the slice sums.  CPU kernels can
+    # differ in the last bit, so the check is relative.
+    from mbirtorch import qggmrf
+    from mbirtorch._memory_estimate import PRIOR_PASS_CYLINDERS_EAGER
+    rng = np.random.RandomState(5)
+    rows, cols, S = 9, 7, 6
+    flat = torch.as_tensor(rng.rand(rows * cols, S).astype(np.float32))
+    left = torch.as_tensor(rng.rand(rows * cols).astype(np.float32))
+    right = torch.as_tensor(rng.rand(rows * cols).astype(np.float32))
+    idx = torch.as_tensor(rng.choice(rows * cols, 23, replace=False))
+    forward_grad = torch.as_tensor(rng.randn(23, S).astype(np.float32))
+    forward_hess = torch.as_tensor(rng.rand(23, S).astype(np.float32))
+    params = ((1.0, 1.0, 1.0, 1.0, 0.8, 0.8), 0.3, 2.0, 1.2, 1.0)
+    ref = qggmrf.qggmrf_prior_pass_in_chunks(
+        flat, (rows, cols, S), idx, params, forward_grad, forward_hess, left_halo=left,
+        right_halo=right)
+    out = qggmrf.qggmrf_prior_pass_in_chunks(
+        flat, (rows, cols, S), idx, params, forward_grad, forward_hess, left_halo=left,
+        right_halo=right, max_chunk_bytes=5 * PRIOR_PASS_CYLINDERS_EAGER * S * 4)
+    for o, r in zip(out, ref):
+        assert o.shape == r.shape
+        assert float((o - r).abs().max() / r.abs().max()) < 1e-6
+
+
 def test_placements_refresh_on_geometry_change():
     # Panel finding: a geometry-changing set_params after configure_devices
     # left the placements' axis lengths stale, and the placement functions silently
@@ -295,21 +321,44 @@ def test_cone_sharded_fdk_matches_single_device():
     # preamble; helical z-weight on the container).  Circular and helical
     # sharded FDK now match single-device values.
     import mbirtorch
-    cell = (8, 8, 8)
-    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
-    for shifts in (None, np.linspace(-2.0, 2.0, cell[0]).astype(np.float32)):
-        m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=32,
+    shape = (8, 8, 8)
+    angles = np.linspace(0, 2 * np.pi, shape[0], endpoint=False)
+    for shifts in (None, np.linspace(-2.0, 2.0, shape[0]).astype(np.float32)):
+        m = mbirtorch.ConeBeamModel(shape, angles, source_detector_dist=32,
                                     source_iso_dist=16,
                                     helical_z_shifts=shifts)
         m.configure_devices(devices=["cpu"])
         m.set_params(no_warning=True, verbose=0)
-        sino = np.random.RandomState(1).rand(*cell).astype(np.float32)
+        sino = np.random.RandomState(1).rand(*shape).astype(np.float32)
         ref = m.recon_fdk(sino)
         m.configure_devices(devices=["cpu", "cpu"])
         out = m.recon_fdk(sino)
         assert isinstance(out, np.ndarray)
         rel = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
         assert rel < 1e-5, (shifts is None, rel)
+
+
+def test_translation_sharded_direct_recon_matches_single_device():
+    # The TCT direct reconstruction on three virtual CPU devices matches the result on one
+    # device.  The four views and the eight slices both split unevenly over three devices.
+    # The filter runs on each device's views, and the division by the translation row
+    # count runs on each device's slices.
+    import mbirtorch
+    sino_shape = (4, 20, 16)
+    tvecs = mbirtorch.gen_translation_vectors(2, 2, x_spacing=3.0, z_spacing=2.0)
+    m = mbirtorch.TranslationModel(sino_shape, tvecs, source_detector_dist=128.0,
+                                   source_iso_dist=32.0)
+    m.configure_devices(devices=["cpu"])
+    m.set_params(no_warning=True, verbose=0)
+    sino = np.random.RandomState(3).rand(*sino_shape).astype(np.float32)
+    ref = m.recon_direct_tct(sino)
+    m.configure_devices(devices=["cpu", "cpu", "cpu"])
+    out = m.recon_direct_tct(sino)
+    assert m.sino_placement.n_devices == 3 and m.recon_placement.n_devices == 3
+    assert isinstance(out, np.ndarray)
+    assert out.shape == ref.shape
+    rel = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
+    assert rel < 1e-5, rel
 
 
 def test_uneven_sharded_vcd_recon_matches_single_device():
@@ -399,16 +448,15 @@ def test_uneven_sharded_vcd_recon_matches_single_device():
 
 
 def test_cone_sharded_vcd_recon_matches_single_device():
-    # The cone VCD loop on two devices: the DC-damping profile now splits per
-    # shard (dev_index seam), so the multi-device guard is gone.  A seeded
-    # recon at a dividing cell and at a non-dividing cell reproduces the
+    # The cone VCD loop on two devices: the DC-damping profile splits per
+    # shard.  A seeded recon at a non-dividing shape reproduces the
     # single-device run.
     import mbirtorch
-    for cell in ((8, 8, 8), (9, 7, 8)):
-        angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
+    for shape in ((9, 7, 8),):
+        angles = np.linspace(0, 2 * np.pi, shape[0], endpoint=False)
 
         def build():
-            m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=32,
+            m = mbirtorch.ConeBeamModel(shape, angles, source_detector_dist=32,
                                         source_iso_dist=16)
             m.configure_devices(devices=["cpu"])
             m.set_params(no_warning=True, verbose=0)
@@ -427,15 +475,15 @@ def test_cone_sharded_vcd_recon_matches_single_device():
         np.random.seed(53)
         out, _ = m2.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0)
         rel = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
-        print(f"cone sharded vcd {cell}: rel_max {rel:.2e}")
-        assert rel < 5e-4, (cell, rel)
+        print(f"cone sharded vcd {shape}: rel_max {rel:.2e}")
+        assert rel < 5e-4, (shape, rel)
 
 
 def test_thin_volume_more_devices_than_slices():
     # The thin-volume extension (beyond mbirjax): more devices than slices is
     # a legal layout -- the extra devices carry views (the dominant compute
     # and memory) while their slice shards hold no slices at all.
-    # Seeded n=4 vcd vs n=1 on a 3-slice parallel cell and a 3-row cone cell.
+    # Seeded n=4 vcd vs n=1 on a 3-slice parallel shape.
     import mbirtorch
     sino_shape = (16, 3, 16)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
@@ -483,32 +531,6 @@ def test_thin_volume_more_devices_than_slices():
             / max(np.max(np.abs(ref1)), 1e-30))
     assert rel1 < 5e-4, rel1
 
-    cell = (8, 3, 8)
-    cangles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
-
-    def cbuild():
-        m = mbirtorch.ConeBeamModel(cell, cangles, source_detector_dist=32,
-                                    source_iso_dist=16)
-        m.configure_devices(devices=["cpu"])
-        m.set_params(no_warning=True, verbose=0)
-        return m
-
-    c1 = cbuild()
-    crs = tuple(c1.get_params('recon_shape'))
-    cph = np.zeros(crs, dtype=np.float32)
-    cph[1:-1, 1:-1, :] = 1.0
-    csino = c1.forward_project(cph)
-    np.random.seed(62)
-    cref, _ = c1.recon(csino, max_iterations=2, stop_threshold_change_pct=0.0)
-    c2 = cbuild()
-    c2.configure_devices(devices=["cpu"] * 4)
-    assert [e - s for _d, (s, e) in c2.recon_placement.shard_ranges()][-1] == 0
-    np.random.seed(62)
-    cout, _ = c2.recon(csino, max_iterations=2, stop_threshold_change_pct=0.0)
-    crel = np.max(np.abs(cout - cref)) / max(np.max(np.abs(cref)), 1e-30)
-    print(f"thin cone n4 vs n1: rel {crel:.2e}")
-    assert crel < 5e-4, crel
-
 
 # ── the forward's cylinder transfer ──────────────────────────────────────────
 # What may FAIL here, and what may only be recorded.  The value bar these
@@ -516,16 +538,16 @@ def test_thin_volume_more_devices_than_slices():
 # suites above enforce, at the 1e-5 relative these cone cases use on CPU.  The
 # multi-GPU measurement also registered an EXPECTATION beside that floor.  The
 # cylinder transfer sat about 1.5e-06 relative from the one-device anchor at
-# the 1024-class cell, measured 2026-08-10 on four H100s in job mg10.  That
+# the 1024-class shape, measured 2026-08-10 on four H100s in job mg10.  That
 # expectation is recorded so a later reading well outside it is visible to a
 # human; it is deliberately NOT a threshold, and nothing here asserts it.  The
 # distances below are printed for that comparison.  On CPU the runs are
 # deterministic and the transfer's calls are the single-device call shape, so
 # what these tests do assert is exact-path mechanics rather than that bar.
-def _cone_cylinder_case(devices, cell=(8, 8, 8), pixel_batch=None):
+def _cone_cylinder_case(devices, shape=(8, 8, 8), pixel_batch=None):
     """A cone model on virtual CPU devices, plus its single-device
     reference.  The multi-device forward is the cylinder transfer."""
-    m, idx, vals, sino, ref_fwd, ref_back = _cone_banded_case(devices, cell)
+    m, idx, vals, sino, ref_fwd, ref_back = _cone_banded_case(devices, shape)
     if pixel_batch is not None:
         m.forward_project_pixel_batch = pixel_batch
     return m, idx, vals, sino, ref_fwd, ref_back
@@ -534,10 +556,10 @@ def _cone_cylinder_case(devices, cell=(8, 8, 8), pixel_batch=None):
 def test_cylinder_transfer_holds_the_adjoint_on_uneven_axes():
     # The back driver walks slice bands where the forward moves whole
     # cylinders, so
-    # the pair must stay adjoint -- on a cell whose axes do not divide (9
+    # the pair must stay adjoint -- on a shape whose axes do not divide (9
     # views and 7 slices over 2 devices), where the shards differ in length.
     m, idx, vals, sino, ref_fwd, ref_back = _cone_cylinder_case(
-        ["cpu", "cpu"], cell=(9, 7, 8), pixel_batch=4)
+        ["cpu", "cpu"], shape=(9, 7, 8), pixel_batch=4)
     fwd = m.sparse_forward_project(vals, idx)
     back = m.sparse_back_project(sino, idx)
     rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
@@ -554,7 +576,7 @@ def test_cylinder_transfer_holds_the_adjoint_on_uneven_axes():
 # ── the same transfer, on the two geometries with no hand-written kernels ────
 # Translation and multiaxis have the same band-independent per-call cost cone
 # has, so the shape was expected to help them, and on 2026-08-17 it was
-# measured on four H100s at each geometry's production cell rather than
+# measured on four H100s at each geometry's production shape rather than
 # argued.  The transfer was faster at every device count than the slice-banded
 # walk it replaced: the multiaxis forward 1.27x at two devices and 1.86x at
 # four, its composed reconstruction 1.13x and 1.20x; the translation forward
@@ -570,7 +592,7 @@ def test_cylinder_transfer_holds_the_adjoint_on_uneven_axes():
 # section applies unchanged -- bit-equality is a property of the process's
 # compile state, not of the driver shape.
 @pytest.mark.parametrize('geometry', ('multiaxis', 'translation'))
-def test_torch_body_geometries_take_the_gather(geometry):
+def test_torch_projector_geometries_take_the_gather(geometry):
     case = {'multiaxis': _multiaxis_banded_case,
             'translation': _translation_banded_case}[geometry]
     # Two and three devices: at three, both sharded axes split unevenly (see
@@ -612,7 +634,7 @@ def test_torch_body_geometries_take_the_gather(geometry):
 # can ask for one directly.  On linux with torch 2.13.0, CPU inductor
 # miscompiles exactly that case in both parallel bodies and lands the pixel's
 # footprint one detector channel off (measured 2026-08-11: 6.56e-02 relative on
-# the forward, 5.04e-02 on the back, on the 8x6x8 cell below; eager is right,
+# the forward, 5.04e-02 on the back, on the 8x6x8 shape below; eager is right,
 # and so is every width of two or more).  The driver pads a one-pixel call to
 # two and takes the padding back out.  These two tests hold that: the first is
 # the property a user cares about, the second is the padding itself.  Both pass

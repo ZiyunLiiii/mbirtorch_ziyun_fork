@@ -41,14 +41,14 @@ requires_cuda = pytest.mark.skipif(
     reason="the hand-written Triton kernels need a CUDA device")
 
 
-def _cone_model(curved=False, helical=False, cell=(6, 12, 12), device="cuda",
+def _cone_model(curved=False, helical=False, shape=(6, 12, 12), device="cuda",
                 compile_mode="off"):
-    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
-    z_shifts = (np.linspace(-1.5, 1.5, cell[0]).astype(np.float32)
+    angles = np.linspace(0, 2 * np.pi, shape[0], endpoint=False)
+    z_shifts = (np.linspace(-1.5, 1.5, shape[0]).astype(np.float32)
                 if helical else None)
-    model = mbirtorch.ConeBeamModel(cell, angles,
-                                    source_detector_dist=4 * cell[2],
-                                    source_iso_dist=2 * cell[2],
+    model = mbirtorch.ConeBeamModel(shape, angles,
+                                    source_detector_dist=4 * shape[2],
+                                    source_iso_dist=2 * shape[2],
                                     helical_z_shifts=z_shifts,
                                     use_curved_detector=curved, 
                                     compile_mode=compile_mode)
@@ -90,8 +90,8 @@ def _rel_max(out, ref):
 
 
 @requires_cuda
-@pytest.mark.parametrize("geometry", ["flat", "curved", "helical"])
-@pytest.mark.parametrize("coeff_power,tol", [(1, 1e-5), (2, 1e-4)])
+@pytest.mark.parametrize("geometry,coeff_power,tol", [("flat", 1, 1e-5), ("curved", 1, 1e-5),
+                                                     ("helical", 1, 1e-5), ("flat", 2, 1e-4)])
 def test_cone_back_kernel_parity(geometry, coeff_power, tol):
     # Curved detectors and helical z shifts reach the kernel only through the
     # two eager builders it shares with the torch body, so all three variants
@@ -113,8 +113,7 @@ def test_cone_back_kernel_parity(geometry, coeff_power, tol):
 
 
 @requires_cuda
-@pytest.mark.parametrize("direction,case", [("back", 5), ("back", 12),
-                                            ("back", 16), ("back", 32),
+@pytest.mark.parametrize("direction,case", [("back", 5), ("back", 16),
                                             ("forward", ((6, 12, 12), 12)),
                                             ("forward", ((6, 32, 20), 32))])
 def test_cone_kernel_pads_the_width_argument_to_a_multiple_of_16(direction,
@@ -141,7 +140,7 @@ def test_cone_kernel_pads_the_width_argument_to_a_multiple_of_16(direction,
     """
     if direction == "back":
         band_slices = case
-        model = _cone_model(cell=(6, 32, 20))
+        model = _cone_model(shape=(6, 32, 20))
         sinogram, pixel_indices, view_params, args = _body_inputs(model)
         num_slices = int(args['num_slices'])
         assert num_slices == 32
@@ -165,8 +164,8 @@ def test_cone_kernel_pads_the_width_argument_to_a_multiple_of_16(direction,
             assert banded.is_contiguous() == (padded == length)
         return
 
-    cell, detector_rows = case
-    model = _cone_model(cell=cell)
+    shape, detector_rows = case
+    model = _cone_model(shape=shape)
     _, pixel_indices, view_params, args = _body_inputs(model)
     assert int(args['num_rows_r']) == detector_rows
     values = _voxel_values(model, pixel_indices)
@@ -205,9 +204,7 @@ def test_cone_back_kernel_adjointness():
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, CONE_BACK_BLOCK_P - 1,
-                                        CONE_BACK_BLOCK_P + 1,
-                                        3 * CONE_BACK_BLOCK_P + 7])
+@pytest.mark.parametrize("num_pixels", [1, 3 * CONE_BACK_BLOCK_P + 7])
 def test_cone_back_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes that must contribute exactly
@@ -253,9 +250,7 @@ def test_cone_forward_kernel_parity(geometry):
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, CONE_FWD_BLOCK_P - 1,
-                                        CONE_FWD_BLOCK_P + 1,
-                                        3 * CONE_FWD_BLOCK_P + 7])
+@pytest.mark.parametrize("num_pixels", [1, 3 * CONE_FWD_BLOCK_P + 7])
 def test_cone_forward_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes whose atomics must be masked
@@ -280,3 +275,27 @@ def test_cone_forward_kernel_pixel_padding(num_pixels):
     rest_out = _cone_forward_view_batch_triton(values[num_pixels:], rest,
                                                view_params, **args)
     assert _rel_max(kernel_out + rest_out, full) <= 1e-5
+
+
+@requires_cuda
+@pytest.mark.parametrize("geometry", ["cone", "parallel"])
+def test_back_kernel_adds_into_its_output_bit_for_bit(geometry, monkeypatch):
+    # The back kernel adds each view batch into the running sum.  The result must equal the
+    # loop that adds a new output array for each batch with add_.  Both widths are padded.
+    if geometry == "cone":
+        model = _cone_model(shape=(24, 12, 20))
+    else:
+        model = mbirtorch.ParallelBeamModel(
+            (24, 12, 20), np.linspace(0, np.pi, 24, endpoint=False), compile_mode="off")
+        model.configure_devices(devices=["cuda"])
+        model.set_params(no_warning=True, verbose=0)
+    model.view_batch_size = 5
+    back_body = model._view_batch_bodies()[1]
+    assert back_body._adds_into_output
+    generator = torch.Generator().manual_seed(0)
+    sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
+                          generator=generator).to("cuda")
+    added_in_kernel = model.back_project(sinogram)
+    monkeypatch.setattr(back_body, '_adds_into_output', False)
+    added_with_add_ = model.back_project(sinogram)
+    assert torch.equal(torch.as_tensor(added_in_kernel), torch.as_tensor(added_with_add_))

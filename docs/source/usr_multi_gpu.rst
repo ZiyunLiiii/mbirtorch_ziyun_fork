@@ -28,6 +28,54 @@ Later reconstructions on the same model reuse the choice.  It is made again only
 sinogram shape or the reconstruction shape changes.
 
 
+.. _usr_estimate_resources:
+
+Checking memory and time before a job
+-------------------------------------
+
+``estimate_resources`` tells you how much GPU memory a reconstruction needs and about how long
+it takes on the GPUs you name.  It needs no data and no GPU, so you can run it on a laptop
+before you submit a job::
+
+    estimate = mbirtorch.estimate_resources(ct_model, gpu_model='H100', num_gpus=8)
+    print(estimate)
+
+It reports the direct, full, and split reconstructions::
+
+                                  GPU memory needed    fits    time, 15 iterations
+    direct reconstruction         56.9 GiB             yes     about 1 minute
+    full reconstruction           78.3 GiB             no      about 70 minutes
+    split reconstruction          44.9 GiB             yes     about 71 minutes
+
+Here the full reconstruction does not fit, so use ``recon_split_sino``.  Times are accurate to
+about a factor of 1.5.  The report also gives the memory and time of one call of
+``forward_project`` and one call of ``back_project``.
+
+The full reference for ``estimate_resources`` is on the :ref:`TomographyModelDocs` page.
+
+
+.. _usr_split_groups:
+
+Split reconstruction on several GPUs
+------------------------------------
+
+``recon_split_sino`` reconstructs a volume too large for the GPUs in sections, and it uses the
+GPUs by one rule: the GPUs are divided into equal groups, as many as possible, so that each group
+can hold a section.  The groups reconstruct sections side by side, and each group takes its
+sections one after another.
+
+- With 8 GPUs, where a section needs 3, the GPUs can divide as 8 groups of 1, 4 of 2, 2 of 4, or
+  1 of 8.  Groups of 1 or 2 are too small, so 2 groups of 4 work side by side.
+- With 5 GPUs, where a section needs 3, the only equal groups are 5 of 1 or 1 of 5.  One GPU is
+  too small, so all 5 reconstruct each section in turn.
+
+For parallel beam a section keeps at least ``min_slices_per_section`` slices, 200 by default.
+For cone beam the two halves are the sections, so there are 2 groups when a half fits on half the
+GPUs, and otherwise 1.  The result's ``split_params`` reports the groups used.  A device choice
+made with ``configure_devices`` limits the GPUs the split may use, and the grouping stays
+automatic.
+
+
 Choosing the devices yourself
 -----------------------------
 

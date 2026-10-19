@@ -1,30 +1,27 @@
-"""TomographyModel: the VCD reconstruction loop, FBP, and projector wrappers.
+"""This module defines the class TomographyModel.  The class holds the VCD reconstruction loop,
+FBP, and the methods that call the projectors.
 
-The module holds the VCD loop (numpy partitions, subset updater, on-device
-line search, positivity), FBP via torch.fft, the auto-regularization chain, the
-placement and gather functions, the multi-device VCD loop, and the public
-numpy-at-the-boundary API.  The loop's working state is always per-device
-(:class:`_sharding.Shards`); a single device is the one-shard case.  The
-checkpoint-resume path mutates the caller's arrays in place.
-
-The order of operations in every formula is deliberate.  A seeded run
-reproduces a reconstruction iteration for iteration, so do not reorder the
-arithmetic.
+The reconstruction loop always splits its arrays into one part per device.  A run on one device
+uses the same code with a single part.  A run with a fixed random seed repeats the same
+reconstruction at every iteration.  For this reason, the order of operations in each formula
+must not be changed.
 """
 
+import concurrent.futures
 import contextlib
 import datetime
 import io
 import math
 import os
+import threading
 import warnings
 
 import numpy as np
 import torch
 
-from . import _memory_ledger
+from . import _memory_estimate
 from . import _sharding
-from . import _widening_floors
+from . import _min_problem_sizes
 from . import qggmrf as _qggmrf
 from . import tomography_utils, vcd_utils
 from .memory_stats import get_memory_stats
@@ -34,13 +31,18 @@ from .projectors import Projectors, maybe_compile
 
 _F32_EPS = float(np.finfo(np.float32).eps)
 
-# This is the number of pixels in one transferred cylinder batch in the multi-device forward
-# projection.  Setting forward_project_pixel_batch on the model overrides it.
+# This is the number of pixels in each batch of voxel cylinders that the multi-device forward
+# projection transfers between devices.
 FORWARD_PIXEL_BATCH = 32768
 
 
-# These module level functions hold the fused per-subset arithmetic, so that
-# each one is compiled once per process.
+def _warn_deprecated_name(old, new):
+    """This function issues a DeprecationWarning that names the old and the new attribute."""
+    warnings.warn(f'{old} is deprecated and will be removed in a future release; use {new}.',
+                  DeprecationWarning, stacklevel=3)
+
+
+# torch.compile compiles each of these module-level functions once per process.
 def _diagonal_update_direction(forward_grad, prior_grad, forward_hess, prior_hess):
     return -((forward_grad + prior_grad) / (forward_hess + prior_hess))
 
@@ -56,27 +58,26 @@ def _forward_lin_quad_const(weighted_error_sinogram, delta_sinogram, fm_constant
 
 
 def _forward_lin_quad_weighted(error_sinogram, delta_sinogram, weights, fm_constant):
-    # The product of the weights and the error is fused into the reductions, so
-    # no array of sinogram size is created for each subset.
     return (fm_constant * torch.sum(weights * error_sinogram * delta_sinogram),
             fm_constant * torch.sum(delta_sinogram * delta_sinogram * weights))
 
 
 def _apply_update(flat_recon, error_sinogram, pixel_indices, delta_scaled,
                   alpha, delta_sinogram):
-    # This updates the reconstruction and the error sinogram in place, in one compiled region.
-    # The state tensors are returned so that callers rebind them rather than use the side effect.
+    # This function updates its inputs in place.  The callers assign the returned tensors to
+    # their state variables.
     flat_recon.index_add_(0, pixel_indices, delta_scaled)
     delta_sumsq = torch.sum(delta_scaled * delta_scaled, dim=0)
-    # This subtracts alpha times delta from the error sinogram.  The addcmul_ form reads alpha from
-    # a zero dimensional device tensor.  The sub_ form would force a host synchronization.
+    # addcmul_ reads alpha from a tensor on the device.  Using sub_ would force a host
+    # synchronization.
     error_sinogram.addcmul_(delta_sinogram, alpha, value=-1)
-    ell1 = torch.sum(torch.abs(delta_scaled))
-    return flat_recon, error_sinogram, delta_sumsq, ell1
+    l1 = torch.sum(torch.abs(delta_scaled))
+    return flat_recon, error_sinogram, delta_sumsq, l1
 
 
 def _resolve_device(device):
-    """'auto' -> cuda if available, else mps, else cpu; else the given device."""
+    """This function converts 'auto' to cuda if CUDA is available, to mps if MPS is available,
+    and otherwise to cpu.  It returns any other value as a torch.device."""
     if device != 'auto':
         return torch.device(device)
     if torch.cuda.is_available():
@@ -87,11 +88,11 @@ def _resolve_device(device):
 
 
 def gpu_devices():
-    """The GPU devices torch can use, as a tuple.
+    """This function returns the GPU devices that torch can use, as a tuple.
 
-    Every CUDA device when CUDA is available, the MPS device alone when CUDA
-    is absent and MPS is present, and an empty tuple when there is no GPU.
-    The tuple reports the hardware and reads no environment variable.
+    If CUDA is available, the tuple holds every CUDA device.  If only MPS is available, the
+    tuple holds the MPS device.  If there is no GPU, the tuple is empty.  The function does not
+    read any environment variable.
     """
     if torch.cuda.is_available():
         return tuple(torch.device('cuda', i) for i in range(torch.cuda.device_count()))
@@ -101,35 +102,26 @@ def gpu_devices():
 
 
 def cpu_devices():
-    """The CPU device, as a one-element tuple.
-
-    torch presents one CPU device however many cores the machine has, so a
-    pool of CPU devices has one entry.
-    """
+    """This function returns the CPU device, as a one-element tuple."""
     return (torch.device('cpu'),)
 
 
 def default_devices():
-    """The devices a run uses when none are named, as a list: the GPU devices
-    when there are any, and otherwise the CPU device."""
+    """This function returns the devices that a run uses when the user names no devices.  It
+    returns the GPU devices as a list if there are any, and otherwise the CPU device."""
     return list(gpu_devices()) or list(cpu_devices())
 
 
 def _array_extremes(array):
-    """Return the minimum and maximum of ``array``, computed where the array
-    already is.
-
-    One pass answers every input check below.  A NaN anywhere propagates into
-    both values, and an infinity appears in the extreme on its own side.  Both
-    reductions run through torch, so a numpy array is wrapped rather than
-    copied, and a device array is never brought back to the host.
+    """This function returns the minimum and the maximum of ``array``.  It computes them on the
+    device that already holds the array.  If the array holds a NaN, both values are NaN.
     """
     if torch.is_tensor(array):
         tensor = array
     else:
         with warnings.catch_warnings():
-            # This function only reads the array, so torch's warning about a
-            # host array that is not writable does not apply.
+            # The code only reads the array, so the torch warning about a non-writable array
+            # does not apply.
             warnings.filterwarnings('ignore', message='.*not writable.*')
             tensor = torch.as_tensor(array)
     return float(tensor.min()), float(tensor.max())
@@ -137,81 +129,67 @@ def _array_extremes(array):
 
 class TomographyModel(ParameterHandler):
     """
-    Base class for all tomography geometries.  It provides projection
-    (:meth:`forward_project`, :meth:`back_project`), reconstruction
-    (:meth:`recon`, :meth:`prox_map`, :meth:`recon_direct`), device
-    configuration (:meth:`~mbirtorch.TomographyModel.configure_devices`), and parameter handling.
-    Users construct a geometry subclass (for example ``ConeBeamModel`` or
-    ``ParallelBeamModel``) rather than this class.
+    This class is used as the base class of all tomography geometries.  It provides projection
+    (:meth:`forward_project`, :meth:`back_project`) and reconstruction (:meth:`recon`,
+    :meth:`prox_map`, :meth:`recon_direct`).  It also provides device configuration
+    (:meth:`~mbirtorch.TomographyModel.configure_devices`) and parameter handling.  Users
+    construct a geometry subclass, such as ``ConeBeamModel`` or ``ParallelBeamModel``, rather
+    than this class.
 
-    Constructor args common to all geometries:
+    All geometries share these constructor arguments:
 
-    * sinogram_shape (tuple of int): (num_views, num_det_rows,
-      num_det_channels).
-    * view_batch_size (int, optional): views per projection call.  None
-      (default) lets each projection method choose.
-    * compile_mode (str, optional): 'auto' (default) compiles the
-      computational kernels with torch.compile; 'off' runs without
-      compilation.
+    * sinogram_shape (tuple of int): The shape (num_views, num_det_rows, num_det_channels).
+    * view_batch_size (int, optional): The number of views in each projection call.  If None
+      (the default), each projection method chooses the number.
+    * compile_mode (str, optional): If 'auto' (the default), mbirtorch compiles the
+      computational kernels with torch.compile.  If 'off', mbirtorch runs without compilation.
     """
 
     def __init__(self, sinogram_shape, view_batch_size=None,
                  compile_mode='auto', **kwargs):
         super().__init__()
-        # The device state resolves on first use, so that inspecting a model or
-        # calling configure_devices never touches a device that was not chosen.
+        # The device is chosen on first use, so mbirtorch does not touch a device it will not use.
         self._torch_device = None
         self._sino_placement = None
         self._recon_placement = None
         self._projector_functions = None
-        # This is the number of views per call in the batched drivers.  None means the body's
-        # default, and the driver may reduce the batch to stay within its memory budget.
+        # This is the number of views per projector call.  None means the projector's default.
         self.view_batch_size = view_batch_size
-        # A compile_mode of 'auto' compiles the main chains with torch.compile,
-        # and 'off' runs them eagerly.
         self.compile_mode = compile_mode
-        # This caches the prox initialization, so that a Plug and Play loop
-        # calls initialize_recon only once.
+        # This holds the stored initialization of prox_map, which later prox_map calls reuse.
         self.prox_data = None
         self._dc_damping_cache = None
-        self.dev2dev_safe = True     # configure_devices probes this.
-        # This becomes False once configure_devices is called.  An explicit
-        # layout belongs to the caller permanently.
+        self.dev2dev_safe = True     # configure_devices tests and sets this value.
+        # This becomes False when the user calls configure_devices.
         self.device_layout_is_automatic = True
-        # This records the (sinogram_shape, recon_shape) pair that the current automatic layout
-        # was decided from.  _apply_device_policy decides again when the shapes do not match.
-        self._settled_shapes = None
-        # This is the workload, either 'recon' or 'direct', that the settled layout's capacity
-        # check was made against.  A call that allocates more than that check priced runs it again.
-        self._settled_workload = None
-        # These are the device counts the automatic choice rejected, for the
-        # run log.
+        # This is the (sinogram_shape, recon_shape) pair for which mbirtorch chose the devices.
+        self._device_choice_shapes = None
+        # This is the task, 'recon' or 'direct', for which mbirtorch checked the memory of the
+        # chosen GPUs.
+        self._device_choice_workload = None
+        # These are the device counts that the automatic choice rejected.  The run log lists them.
         self.device_choice_rejections = []
-        self._speed_floor_fallback = None
-        self._speed_floor_held = None
-        # The preflight margin covers memory the ledger cannot see, such as fragmentation and
-        # CUDA workspaces outside torch.  The preflight runs when the automatic layout is decided,
-        # so setting skip_memory_preflight later has no effect until the shapes change.
-        self.skip_memory_preflight = False
-        self.memory_preflight_margin = 0.15
-        # These two exist for a test harness to read.  Nothing in the library
-        # reads them.
-        self.last_memory_ledger = None
+        self._size_limit_fallback = None
+        self._size_limit_held = None
+        # The memory check runs when mbirtorch chooses the devices.  A later change to this value
+        # has no effect until the shapes change.
+        self.skip_memory_check = False
+        self.memory_check_margin = 0.15
+        # Only the tests read these two values.
+        self.last_memory_estimate = None
         self.last_memory_calibration = None
-        # _vcd_recon owns the per-device thread pool.  It is None outside a
-        # reconstruction.
+        # This is the thread pool of _vcd_recon, with one thread per device.  It is None outside
+        # a reconstruction.
         self._per_device_pool = None
 
-        # The geometry's own parameters, such as angles, are added as new Param
-        # entries.
         from ._utils import Param
         for key, val in kwargs.items():
             self.params[key] = Param(val, True)
         self.set_params(no_compile=True, no_warning=True,
                         sinogram_shape=tuple(int(s) for s in sinogram_shape))
 
-        # The order matters.  The geometry defaults come first, then the
-        # projectors, then the validity check.
+        # The order matters.  The geometry defaults come first, then the projectors, and then the
+        # validity check.
         self.auto_set_recon_geometry(no_compile=True, no_warning=True)
         self.verify_valid_params()
 
@@ -219,17 +197,11 @@ class TomographyModel(ParameterHandler):
     def compile_enabled(self):
         return self.compile_mode != 'off'
 
-    # Each device property below resolves on first read and can also be
-    # assigned directly by configure_devices and by the automatic widening.
     @property
     def torch_device(self):
-        """The model's lead device, resolved on first use.
-
-        Resolution is 'auto': cuda if available, else mps, else cpu.  A
-        caller who wants something else calls
-        ``configure_devices(devices=[...])``, which sets this before anything
-        reads it, so no device is ever touched that the caller did not ask
-        for."""
+        """This property returns the first device of the model.  If ``configure_devices`` has
+        not set the device, the property chooses it on first use.  It chooses cuda if CUDA is
+        available, mps if MPS is available, and otherwise cpu."""
         if self._torch_device is None:
             self._torch_device = _resolve_device('auto')
         return self._torch_device
@@ -238,8 +210,8 @@ class TomographyModel(ParameterHandler):
     def torch_device(self, value):
         self._torch_device = torch.device(value)
 
-    # Sinogram arrays are sharded by view, which is axis 0.  Reconstruction
-    # arrays are sharded by slice, which is the last axis.
+    # Sinograms are split across devices by view (axis 0).  Reconstructions are split across
+    # devices by slice (the last axis).
     @property
     def sino_placement(self):
         if self._sino_placement is None:
@@ -264,8 +236,8 @@ class TomographyModel(ParameterHandler):
 
     @property
     def projector_functions(self):
-        """The projection driver, built on first use against the layout then
-        in force."""
+        """This property returns the projector object.  The property builds the object on first
+        use, for the devices that the model uses at that time."""
         if self._projector_functions is None:
             self.create_projectors()
         return self._projector_functions
@@ -279,8 +251,8 @@ class TomographyModel(ParameterHandler):
         self.projector_functions = Projectors(self)
 
     def get_magnification(self):
-        """Return the magnification for this geometry.  Each geometry model
-        defines this; parallel beam returns 1.0."""
+        """This method returns the magnification of this geometry.  The parallel-beam geometry
+        returns 1.0."""
         raise NotImplementedError
 
     def get_psf_radius(self):
@@ -288,79 +260,63 @@ class TomographyModel(ParameterHandler):
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
         """
-        Set the automatic value of the recon shape and voxel pitch using the
-        geometry parameters and sinogram shape.  Each geometry model defines
-        this.
+        This method sets the automatic values of the recon shape and the voxel pitch.  It
+        computes these values from the geometry parameters and the sinogram shape.
 
-        Call this after changing any detector or geometry parameter with
-        ``set_params``, such as ``delta_det_channel``; otherwise the
-        reconstruction comes out at the wrong scale.  It sets ``recon_shape``,
-        ``delta_voxel``, and ``recon_slice_offset`` from the detector, so
-        resize or shift the region of reconstruction only after it.
+        The user must call this method after any change to a detector or geometry parameter,
+        such as ``delta_det_channel``.  Otherwise, the reconstruction has the wrong scale.  The
+        method sets ``recon_shape``, ``delta_voxel``, and ``recon_slice_offset``.  For this
+        reason, any resize or shift of the region of reconstruction must come after this call.
 
         Args:
-            no_compile (bool, optional): If True, do not rebuild the
-                projectors.  Defaults to False.
-            no_warning (bool, optional): If True, do not issue warnings.
+            no_compile (bool, optional): If True, the method does not rebuild the projectors.
+                Defaults to False.
+            no_warning (bool, optional): If True, the method does not issue warnings.
                 Defaults to False.
         """
         raise NotImplementedError
 
     def _view_batch_bodies(self):
-        """Return the geometry's projection bodies for one view batch, as
-        (forward, back).
-
-        These must be module level functions that take parameter values built
-        by :meth:`_view_batch_args`.  A bound method would hold the model in the
-        module level compile cache, and a parameter read inside the compiled
-        region would make dynamo trace the parameter machinery."""
+        """This method returns the two module-level functions of this geometry that project one
+        batch of views.  It returns them as the pair (forward, back)."""
         raise NotImplementedError(
             f'{type(self).__name__} defines no per-view-batch projection '
             'bodies.')
 
     def _view_batch_args(self):
-        """Return the argument dictionary for this geometry's projection
-        bodies.  Every parameter read happens here, outside the traced region,
-        on every call.  The values must not be frozen at build time."""
+        """This method returns the dictionary of arguments for the projection functions of this
+        geometry.  It reads the parameters on every call, outside the compiled code."""
         raise NotImplementedError
 
     def _transient_cols(self, band_cols):
-        """Return the column count of this geometry's largest temporary array
-        for one view, which sets the driver's view batch budget.
-
-        The base class returns the band length.  A geometry whose slice band
-        projects onto many detector rows, such as cone beam, overrides this
-        with a width derived from its parameters.  Changing the value changes
-        batch sizes, the order of floating point summation, and peak memory."""
+        """This method returns the number of columns of the largest temporary array that this
+        geometry uses for one view.  The projector uses this number to set its view batch
+        size."""
         return band_cols
 
     def recon_direct(self, sinogram, filter_name=None, output_sharded=False):
         """
-        Do a direct (non-iterative) reconstruction, typically using a form of
-        filtered backprojection.  The implementation details are geometry
-        specific, and recon_direct may not be available for all geometries.
+        This method performs a direct, non-iterative reconstruction, which is typically a form
+        of filtered back projection.  Some geometries do not provide this method.
 
         Args:
-            sinogram (numpy or tensor): 3D sinogram data with shape
+            sinogram (numpy or tensor): The 3D sinogram, with shape
                 (num_views, num_det_rows, num_det_channels).
-            filter_name (string, optional): The name of the filter to use.
-                Every geometry's implementation defaults to 'ramp'.
-            output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the device form: a torch
-                tensor on a single device, or a Shards container (one
-                tensor per device) on a multi-device model.
+            filter_name (string, optional): The name of the filter.  Every geometry uses 'ramp'
+                as the default.
+            output_sharded (bool, optional): If False (the default), the method returns a numpy
+                array.  If True, the method returns the result on the devices.  On a model with
+                one device, the result is a torch tensor.  On a model with several devices, the
+                result is a Shards container with one tensor per device.
 
         Returns:
             recon (numpy or tensor): The reconstructed volume.
 
         Note:
-            An implementation settles the device layout before its first large
-            allocation, with ``self._apply_device_policy(workload='direct')``
-            as its first statement.  Without that call a direct reconstruction
-            on a model whose layout the caller has not fixed runs whole on the
-            lead device; with it, the memory check prices the direct
-            reconstruction rather than the full recon the device count is
-            chosen for.
+            This note is for a developer who writes a new geometry.  The version of this method
+            in the new geometry must call ``self._apply_device_policy(workload='direct')``
+            before it allocates any large array.  If the user has not chosen the GPUs, that call
+            chooses them.  The call also checks the memory that a direct reconstruction needs.
         """
         raise NotImplementedError
 
@@ -370,47 +326,137 @@ class TomographyModel(ParameterHandler):
                          logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
                          align_split_grid=False):
         """
-        Perform MBIR reconstruction with less memory than :meth:`recon` by
-        splitting the detector rows into overlapping row bands -- two halves
-        for cone beam, one or more parts for parallel beam -- reconstructing
-        one band at a time, and stitching the results.  The output is
-        approximately equal to the output of :meth:`recon`.
+        This method reduces the memory that MBIR reconstruction needs.  It reconstructs the
+        volume in sections and joins the results.  It is meant for a volume that does not fit on
+        the GPUs as a whole.
 
-        The split arithmetic is geometry specific, and recon_split_sino may
-        not be available for all geometries; geometries without an
-        implementation raise ``NotImplementedError``.
+        The method divides the detector rows into overlapping sections.  Cone beam uses two
+        halves, and parallel beam uses one or more sections.  The method reconstructs each
+        section with ordinary MBIR.  It then joins the sections with a linear blend across the
+        overlap.  The method divides the GPUs into the largest number of equal groups that can
+        each hold a section, and the groups run at the same time.
+
+        The user calls this method in the same way as :meth:`recon`.  The result is
+        approximately equal to the result of :meth:`recon`.  If the user chose devices with
+        ``configure_devices``, the method uses only those GPUs.  A geometry that does not
+        implement this method raises ``NotImplementedError``.
 
         Args:
-            sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).  A
-                sharded array is not accepted.
-            weights (numpy or tensor, optional): Optional sinogram weights with the same shape as
-                `sino`.  Not accepted in sharded form, like `sino`.
-            half_overlap (int, optional): Number of overlapping detector rows
-                kept past the split in each half.  Defaults to 5.
-            init_recon (optional): Same as in :meth:`recon`.  Not accepted in
-                sharded form, like `sino`.
-            max_iterations (int, optional): Same as in :meth:`recon`.
-            stop_threshold_change_pct (float, optional): Same as in :meth:`recon`.
-            first_iteration (int, optional): Same as in :meth:`recon`.
-            compute_prior_loss (bool, optional): Accepted for interface
-                compatibility; not currently used.
-            logfile_path (str, optional): Same as in :meth:`recon`.  The two
-                halves' logs are merged into this single file.
-            print_logs (bool, optional): Same as in :meth:`recon`.
-            align_split_grid (bool, optional): If True, shift the recon slice
-                grid by up to half a slice to align the split with the
-                sinogram cut, which removes seam stripes.  Defaults to False.
+            sino (numpy or tensor): The full sinogram, with shape (num_views, num_rows,
+                num_cols).  The method does not accept a sharded array.
+            weights (numpy or tensor, optional): The sinogram weights, with the same shape as
+                ``sino``.  The method does not accept a sharded array.
+            half_overlap (int, optional): The number of overlapping detector rows that each half
+                keeps past the split.  Defaults to 5.
+            init_recon (optional): The same as in :meth:`recon`.  The method does not accept a
+                sharded array.
+            max_iterations (int, optional): The same as in :meth:`recon`.
+            stop_threshold_change_pct (float, optional): The same as in :meth:`recon`.
+            first_iteration (int, optional): The same as in :meth:`recon`.
+            compute_prior_loss (bool, optional): The method accepts this argument so that its
+                interface matches :meth:`recon`.  The method ignores this argument.
+            logfile_path (str, optional): The same as in :meth:`recon`.  The method merges the
+                logs of the two halves into this one file.
+            print_logs (bool, optional): The same as in :meth:`recon`.
+            align_split_grid (bool, optional): If True, the method shifts the grid of recon
+                slices by up to half a slice.  The shift aligns the split with the cut in the
+                sinogram.  The alignment removes stripes at the seam.  Defaults to False.
 
         Returns:
-            Tuple[np.ndarray, dict]: the reconstructed volume, and a metadata
-            dictionary with the recon and model parameters for each half plus
-            ``'split_params'`` (the overlaps and any alignment shift used).
-            If the split would leave either half too thin, the method warns,
-            performs a standard :meth:`recon` instead, and returns that
-            result's dictionary (no per-half entries).
+            Tuple[np.ndarray, dict]: The reconstructed volume and a metadata dictionary.  The
+            dictionary holds the recon and model parameters of each half.  It also holds
+            ``'split_params'``, which lists the overlaps, any alignment shift, ``'num_groups'``,
+            and ``'gpus_per_group'``.  If the split would leave either half too thin, the method
+            issues a warning and performs a standard :meth:`recon` instead.  In that case it
+            returns the dictionary of that reconstruction, which has no entries for the halves.
         """
         raise NotImplementedError(
             f'recon_split_sino is not implemented for {type(self).__name__}.')
+
+    # ── the sections of a split reconstruction ────────────────────────────────
+
+    def _split_devices(self):
+        """This method returns the devices that a split reconstruction divides into groups.  If
+        the user chose devices, it returns those devices.  Otherwise, it returns every GPU that
+        the automatic device choice could use."""
+        if not self.device_layout_is_automatic:
+            return list(self.sino_placement.devices)
+        visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        env_count = _memory_estimate.env_device_count()
+        if env_count is not None:
+            visible = min(env_count, visible)
+        return self._candidate_devices(visible) if visible > 1 else [self.torch_device]
+
+    def _section_fits(self, section_model, devices, weighted):
+        """This method returns True if a reconstruction of ``section_model`` fits in the memory
+        of ``devices``."""
+        if self.skip_memory_check:
+            return True
+        call_arrays = {}
+        if weighted:
+            # This is a read-only array with the sinogram shape that uses almost no memory.
+            shape = tuple(int(n) for n in section_model.get_params('sinogram_shape'))
+            call_arrays['weights'] = np.broadcast_to(np.ones(1, dtype=np.float32), shape)
+        estimate = section_model._estimate_memory(devices=devices, workload='recon',
+                                                  **call_arrays)
+        if estimate is None:
+            return True
+        fits, _rows = section_model._layout_capacity(devices, estimate, call_arrays)
+        return fits
+
+    @staticmethod
+    def _choose_gpus_per_group(devices, fits, max_groups=None):
+        """This method returns the number of devices in each group of a split reconstruction.
+        It returns the smallest group size that divides the device count, gives at most
+        ``max_groups`` groups, and passes the test ``fits``.  If no size meets these conditions,
+        the method puts all the devices in one group.
+        """
+        num_devices = len(devices)
+        for size in range(1, num_devices):
+            if num_devices % size or (max_groups is not None and num_devices // size > max_groups):
+                continue
+            if fits(devices[:size]):
+                return size
+        return num_devices
+
+    @staticmethod
+    def _run_split_sections(jobs, devices, gpus_per_group):
+        """This method runs the sections of a split reconstruction, and it returns their results
+        in order.  If there are several groups, each group runs in its own thread.  In that case,
+        each section gets its own random generator, seeded from the global np.random state, and
+        each thread uses the caller's torch thread count, so that the compiled sums add in the
+        same order as they do when a section runs alone.
+        """
+        if gpus_per_group >= len(devices):
+            return [job(None, None) for job in jobs]
+        groups = [devices[i:i + gpus_per_group] for i in range(0, len(devices), gpus_per_group)]
+        seeds = np.random.randint(0, 2 ** 31 - 1, size=len(jobs))
+        results = [None] * len(jobs)
+        lock = threading.Lock()
+        state = {'next': 0, 'failed': False}
+        num_threads = torch.get_num_threads()
+
+        def run_group(group):
+            torch.set_num_threads(num_threads)
+            while True:
+                with lock:
+                    index = state['next']
+                    if index >= len(jobs) or state['failed']:
+                        return
+                    state['next'] += 1
+                try:
+                    results[index] = jobs[index](group, np.random.default_rng(int(seeds[index])))
+                except BaseException:
+                    # After a section fails, the other groups do not start new sections.
+                    with lock:
+                        state['failed'] = True
+                    raise
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(groups)) as executor:
+            futures = [executor.submit(run_group, group) for group in groups]
+            for future in futures:
+                future.result()
+        return results
 
     def recon_plastic_metal(self, sino, weights, num_BH_iterations=3, num_constraint_update_iter=10,
                             stop_threshold_change_pct=0.2, num_metal=1, order=3, alpha=1, beta=0.002,
@@ -418,57 +464,58 @@ class TomographyModel(ParameterHandler):
                             logfile_path='~/.mbirtorch/logs/recon.log',
                             radial_margin=None, top_margin=None, bottom_margin=None):
         """
-        Perform iterative metal artifact reduction using plastic-metal beam hardening correction.  If num_metal is 0,
-        then this performs a standard MBIR recon.
+        This method performs iterative metal artifact reduction with plastic-metal beam
+        hardening correction.  If ``num_metal`` is 0, the method performs a standard MBIR recon.
 
-        The method alternates between adaptive beam hardening correction (via `correct_sino_plastic_metal`)
-        and reconstruction, refining the image over several iterations to suppress metal-induced artifacts.
-
-        The method works on any geometry that provides `recon_direct` and `recon`.  For a cone
-        beam model the reconstruction passes use `recon_split_sino`; for every other geometry they
-        use `recon`.  It has been used mainly with cone beam models.
+        The method alternates between beam hardening correction and reconstruction.  The
+        function ``correct_sino_plastic_metal`` performs the beam hardening correction.  The
+        method works on any geometry that provides ``recon_direct`` and ``recon``.  A cone-beam
+        model reconstructs with ``recon_split_sino``, and every other geometry reconstructs with
+        ``recon``.
 
         Args:
-            sino (numpy or tensor):  Input sinogram data to be corrected.  A tensor is converted to
-                numpy at entry.  An array in sharded form is not accepted.
-            weights (numpy or tensor): Transmission weights used in the reconstruction algorithm.  A
-                tensor is converted to numpy at entry.  Not accepted in sharded form, like
-                `sino`.
-            num_BH_iterations (int, optional): Number of correction-reconstruction iterations. Defaults to 3.
-            num_constraint_update_iter (int, optional): Number of iterations for updating constraints.
-                At each iteration, the most violated constraints are activated and the quadratic program is re-solved via OSQP.
-            stop_threshold_change_pct (float, optional): Relative change threshold (%) for early stopping in MBIR. Defaults to 0.2.
-            num_metal (int, optional): Number of metal materials to segment and correct for. Defaults to 1.
-            order (int, optional): Maximum total degree of the beam hardening correction polynomial. Defaults to 3.
-            alpha (float, optional): Degree-dependent scaling factor for regularization weights. Higher values penalize
-                higher-order terms more strongly. Defaults to 1.
-            beta (float, optional): Regularization strength for ridge regression. Defaults to 0.002.
-            gamma (float, optional): Stabilization factor used in plastic correction. Multiplies the mean of `s_p`
-                to set a positive floor in the denominator, preventing division by near-zero or negative values. Defaults to 0.1.
-            verbose (int, optional): Verbosity level for printing intermediate information. Defaults to 0.
-            max_iterations (int, optional): Maximum MBIR iterations per reconstruction pass. Defaults to 15.
-            logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The BH passes'
-                logs are merged into this single file, each under a section header.
-            radial_margin, top_margin, bottom_margin (int or None, optional): Segmentation mask margins
-                used when classifying plastic/metal; None (default) = size-relative
-                (see segment_plastic_metal).
+            sino (numpy or tensor): The sinogram to correct.  The method converts a tensor to
+                numpy on entry.  The method does not accept a sharded array.
+            weights (numpy or tensor): The transmission weights for the reconstruction.  The
+                method converts a tensor to numpy on entry.  The method does not accept a
+                sharded array.
+            num_BH_iterations (int, optional): The number of correction and reconstruction
+                iterations.  Defaults to 3.
+            num_constraint_update_iter (int, optional): The number of iterations that update the
+                constraints.  At each iteration, the method activates the most violated
+                constraints and solves the quadratic program again with OSQP.
+            stop_threshold_change_pct (float, optional): The threshold, in percent, on the
+                relative change for early stopping in MBIR.  Defaults to 0.2.
+            num_metal (int, optional): The number of metal materials to segment and correct.
+                Defaults to 1.
+            order (int, optional): The maximum total degree of the beam hardening correction
+                polynomial.  Defaults to 3.
+            alpha (float, optional): The scaling factor of the regularization weights, which
+                depends on the degree.  Higher values penalize the higher-order terms more
+                strongly.  Defaults to 1.
+            beta (float, optional): The regularization strength of the ridge regression.
+                Defaults to 0.002.
+            gamma (float, optional): The stabilization factor of the plastic correction.  The
+                method multiplies the mean of ``s_p`` by ``gamma`` to set a positive lower bound
+                on the denominator.  Defaults to 0.1.
+            verbose (int, optional): The verbosity level for printing intermediate information.
+                Defaults to 0.
+            max_iterations (int, optional): The maximum number of MBIR iterations in each
+                reconstruction pass.  Defaults to 15.
+            logfile_path (str, optional): The same as in :meth:`recon`.  The method merges the
+                logs of the beam hardening passes into this one file, each under a section
+                header.
+            radial_margin, top_margin, bottom_margin (int or None, optional): The margins of the
+                segmentation mask that classifies plastic and metal.  If None (the default), the
+                margins scale with the volume size.  See ``segment_plastic_metal``.
 
         Returns:
-             (recon, recon_dict): The final corrected reconstruction after iterative beam hardening
-             correction as a host NumPy array, and the reconstruction dictionary from its final
-             reconstruction pass.
+             (recon, recon_dict): The final corrected reconstruction as a NumPy array in host
+             memory, and the reconstruction dictionary of the final reconstruction pass.
 
         Example:
             >>> recon, recon_dict = ct_model.recon_plastic_metal(
-            ...     sino, weights,
-            ...     num_BH_iterations=3,
-            ...     stop_threshold_change_pct=0.2,
-            ...     num_metal=1,
-            ...     order=3,
-            ...     alpha=1,
-            ...     beta=0.005,
-            ...     verbose=1
-            ... )
+            ...     sino, weights, num_BH_iterations=3, num_metal=1, order=3, beta=0.005)
             >>> mbirtorch.slice_viewer(recon)
         """
         import functools
@@ -480,8 +527,7 @@ class TomographyModel(ParameterHandler):
         if num_metal < 0:
             raise ValueError("num_metal must be >= 0")
 
-        # This driver accepts host input only.  The check comes before np.asarray, which would
-        # build an object array from a sharded input rather than fail.
+        # This check must come before np.asarray, because np.asarray would accept a sharded input.
         if (isinstance(sino, _sharding.Shards)
                 or isinstance(weights, _sharding.Shards)):
             raise ValueError(
@@ -496,16 +542,13 @@ class TomographyModel(ParameterHandler):
                 weights = weights.detach().cpu().numpy()
             weights = np.asarray(weights)
 
-        # Cone beam uses the split sinogram recon when the model provides it, because that form
-        # splits on the host and never places the full sinogram on the devices.  Other geometries
-        # use the standard recon with a device form output.
+        # Cone beam uses recon_split_sino, which never puts the full sinogram on the devices.
         if ('cone' in self.get_params('geometry_type')
                 and type(self).recon_split_sino is not TomographyModel.recon_split_sino):
             recon_function = self.recon_split_sino
         else:
             recon_function = functools.partial(self.recon, output_sharded=True)
 
-        # The output is always a host numpy array.
         def to_output_form(r):
             return r if isinstance(r, np.ndarray) else self._gather_recon(r)
 
@@ -519,8 +562,7 @@ class TomographyModel(ParameterHandler):
             print("\n************ Perform initial FDK reconstruction  **************")
         recon = self.recon_direct(sino, output_sharded=True)
 
-        # Each beam hardening pass logs to its own temporary file.  The files are merged in the
-        # finally block, so the logs of the passes that ran before a failure are kept.
+        # Each pass writes its own log file.  The finally block merges the files.
         if logfile_path:
             log_path = os.path.expanduser(logfile_path)
             pass_log_paths = [log_path + '.pass{}'.format(i + 1) for i in range(num_BH_iterations)]
@@ -535,8 +577,8 @@ class TomographyModel(ParameterHandler):
 
                 if verbose >= 1:
                     print(f"\n************ Perform MBIR reconstruction {i + 1} **************")
-                # The recon entry points require init_recon to be a host array
-                # or a tensor, so a sharded reconstruction is gathered first.
+                # The recon methods need host arrays or tensors, so the sharded recon is gathered
+                # into one array.
                 init = (self._gather_recon(recon)
                         if isinstance(recon, _sharding.Shards) else recon)
                 recon, recon_dict = recon_function(corrected_sinogram, weights=weights, init_recon=init,
@@ -555,8 +597,8 @@ class TomographyModel(ParameterHandler):
                                     title=f'Iteration {i + 1}: Comparison of Plastic and Metal Masks')
         finally:
             if log_path:
-                # A pass that failed partway may have left its log file open,
-                # and the merge below deletes the files it merges.
+                # A failed pass may have left its log file open.  The file must be closed because
+                # the merge deletes the files.
                 self.close_log_file()
                 labels = ['recon_plastic_metal: BH pass {}'.format(i + 1) for i in range(num_BH_iterations)]
                 merge_log_files(log_path, zip(labels, pass_log_paths))
@@ -565,12 +607,11 @@ class TomographyModel(ParameterHandler):
 
     # ── projection wrappers ───────────────────────────────────────────────────
     def sparse_forward_project(self, voxel_values, pixel_indices):
-        """Cylinders at ``pixel_indices`` -> full sinogram.  This is the ONE
-        funnel for sparse forward projection: the recon engine, the dense
-        wrappers, and external callers all route here, so the surface the
-        metrics harness measures is the surface the engine runs.  The output
-        matches the input form: a plain tensor in, a tensor out (single
-        device); ``Shards`` in, or a multi-device placement, view shards out."""
+        """This method forward projects the voxel values at ``pixel_indices`` to a full
+        sinogram.  The voxel values at one pixel index form a cylinder of voxels through all
+        slices.  If the input is a tensor, the output is a tensor.  If the input is ``Shards``,
+        or if the model uses several devices, the output is a sinogram split by view across the
+        devices."""
         voxel_values = self._shard_recon(voxel_values)
         if isinstance(voxel_values, _sharding.Shards):
             return self._sparse_forward_project_sharded(voxel_values, pixel_indices)
@@ -578,10 +619,9 @@ class TomographyModel(ParameterHandler):
             voxel_values, pixel_indices)
 
     def sparse_back_project(self, sinogram, pixel_indices, coeff_power=1):
-        """Sinogram -> cylinders at ``pixel_indices``.  The one funnel for
-        sparse back projection (see :meth:`sparse_forward_project`); the
-        output matches the input form: tensor in, tensor out; ``Shards`` in,
-        or a multi-device placement, slice shards out."""
+        """This method back projects a sinogram to the voxel cylinders at ``pixel_indices``.
+        If the input is a tensor, the output is a tensor.  If the input is ``Shards``, or if the
+        model uses several devices, the output is split by slice across the devices."""
         sinogram = self._shard_sinogram(sinogram)
         if isinstance(sinogram, _sharding.Shards):
             return self._sparse_back_project_sharded(sinogram, pixel_indices,
@@ -590,42 +630,34 @@ class TomographyModel(ParameterHandler):
             sinogram, pixel_indices, coeff_power=coeff_power)
 
     def _band_pool(self, n):
-        """Return the thread pool for a sharded projection.  This reuses the
-        reconstruction loop's pool when one is active, and otherwise creates a
-        pool for this call alone."""
+        """This method returns the thread pool for a sharded projection."""
         if self._per_device_pool is not None:
             return contextlib.nullcontext(self._per_device_pool)
         return _sharding.device_pool(n)
 
     @staticmethod
     def _slice_band_length(slices_per_dev, n_dev, num_pixels, fixed_band=None):
-        """Return the band length for streaming the slice axis in the banded
-        back projection.
-
-        The default is one band per device, which holds the whole shard.
-        Smaller bands were measured to be slower, but they use less memory.
-        Setting ``back_project_slice_band`` on the model selects a smaller
-        band.  The result never exceeds slices_per_dev, so a band never crosses
-        a device boundary."""
+        """This method returns the number of slices in each group of slices that the
+        multi-device back projection processes at one time.  By default, each device processes
+        all its slices at once.  The model attribute ``back_project_slice_band`` sets a smaller
+        number."""
         b = fixed_band if fixed_band else slices_per_dev
         return min(int(b), slices_per_dev)
 
     def _forward_pixel_batch(self):
-        """Return the number of pixels in one transferred cylinder batch.  The
-        default is :data:`FORWARD_PIXEL_BATCH`, and
-        ``forward_project_pixel_batch`` on the model overrides it.  The memory
-        ledger calls this method rather than compute the number itself."""
+        """This method returns the number of pixels in each batch of voxel cylinders that the
+        forward projection transfers between devices.  The default is
+        :data:`FORWARD_PIXEL_BATCH`.  The model attribute ``forward_project_pixel_batch``
+        overrides the default."""
         fixed = getattr(self, 'forward_project_pixel_batch', None)
         return max(1, int(fixed)) if fixed else FORWARD_PIXEL_BATCH
 
     @staticmethod
     def _balanced_slice_bounds(extent, band_len):
-        """Split ``[0, extent)`` into the fewest bands no longer than
-        ``band_len``.  The bands do not overlap, and their lengths differ by at
-        most one.  An extent that is not positive gives no bands."""
+        """This method splits ``[0, extent)`` into the fewest intervals of length at most
+        ``band_len``.  The lengths of the intervals differ by at most one."""
         if extent <= 0:
-            # A shard with no slices also has a band length of 0, so the
-            # division below would divide by zero.
+            # A device with no slices gets no intervals.
             return []
         num_bands = -(-extent // band_len)            # Ceiling division.
         base, rem = divmod(extent, num_bands)
@@ -637,15 +669,16 @@ class TomographyModel(ParameterHandler):
         return bounds
 
     def _banded_setup(self, pixel_indices):
-        """Shared setup for the sharded projectors: per-owner view spans,
-        recon slice ranges, and the pixel indices placed once per device."""
+        """This method builds the values that the multi-device projectors share.  These are
+        the view range of each device, the slice range of each device, and a copy of the pixel
+        indices on each device."""
         sp, rp = self.sino_placement, self.recon_placement
         if type(self)._view_batch_bodies is TomographyModel._view_batch_bodies:
             raise NotImplementedError(
                 f'{type(self).__name__} has no per-view-batch projection '
                 'bodies, so the multi-device drivers cannot run.')
-        # These are half open view spans and slice band ranges, in device order.  A span can be
-        # empty, because with more devices than views or slices the trailing devices own nothing.
+        # The view ranges and slice ranges are half-open and in device order.  The last devices
+        # may hold no views or slices.
         view_spans = [span for _d, span in sp.shard_ranges()]
         band_ranges = rp.shard_ranges()
         idx_per_dev = [torch.as_tensor(pixel_indices, dtype=torch.int64).to(d)
@@ -653,9 +686,8 @@ class TomographyModel(ParameterHandler):
         return sp, rp, view_spans, band_ranges, idx_per_dev
 
     def _sparse_forward_project_sharded(self, voxel_shards, pixel_indices):
-        """Run the sharded forward projection.  A single device placement calls
-        the plain driver.  A multi-device placement calls
-        :meth:`_sparse_forward_project_cylinders`."""
+        """This method runs the forward projection on voxel values that are split across
+        devices."""
         if voxel_shards.placement.is_trivial:
             return _sharding.Shards(
                 [self.projector_functions._sparse_forward_project_single_device(
@@ -665,24 +697,18 @@ class TomographyModel(ParameterHandler):
                                                       pixel_indices)
 
     def _sparse_forward_project_cylinders(self, voxel_shards, pixel_indices):
-        """Run the multi-device forward projection as a cylinder transfer in
-        pixel batches.
-
-        Each device that owns views walks the pixel axis in batches.  For each
-        batch it collects the full height cylinders from every device that owns
-        slices, then makes one projector call over its own views and the whole
-        slice range.  The pixel batch size bounds the transfer between devices,
-        and the memory ledger charges for it."""
+        """This method runs the multi-device forward projection.  The voxel cylinders are
+        transferred between devices in batches of pixels.  Each device that holds views
+        collects each batch of full-height cylinders from the devices that hold slices.  The
+        device then projects the batch onto its own views."""
         sp, rp, view_spans, _band_ranges, idx_per = self._banded_setup(
             pixel_indices)
         pf = self.projector_functions
         num_channels = int(self.get_params('sinogram_shape')[2])
-        # This is the block height per call.  A row aligned body sizes its output by the
-        # transferred cylinders, which span the whole slice axis.  A two fan body returns rows.
         num_rows = (int(rp.axis_len) if self.rows_track_slices
                     else int(self.get_params('sinogram_shape')[1]))
         num_pixels = int(idx_per[0].shape[0])
-        shards = voxel_shards.tensors        # Device order is global slice order.
+        shards = voxel_shards.tensors        # The device order is the order of the slices.
         pixel_batch = self._forward_pixel_batch()
         batch_bounds = [(p0, min(p0 + pixel_batch, num_pixels))
                         for p0 in range(0, num_pixels, pixel_batch)]
@@ -690,7 +716,6 @@ class TomographyModel(ParameterHandler):
         def worker(i, dev):
             v0, v1 = view_spans[i]
             if v1 <= v0:
-                # A device that owns no views produces an empty block.
                 return torch.zeros((0, num_rows, num_channels),
                                    dtype=voxel_shards.dtype, device=dev)
             local_idx = idx_per[i]
@@ -701,17 +726,15 @@ class TomographyModel(ParameterHandler):
                 return _sharding.transfer_cylinder_batch_async(
                     shards, p0, p1, dev, self.dev2dev_safe)
 
-            # This holds the batch transferred ahead of the one being
-            # projected.
+            # This holds the batch that is transferred while the current batch is projected.
             ahead = transfer(0) if batch_bounds else None
             for k, (p0, p1) in enumerate(batch_bounds):
                 full_cyl, ready = ahead
-                # The next batch's transfer is issued before this batch is projected, on separate
-                # streams.  The wait below keeps a projection from starting before its copies land.
+                # The copy of the next batch starts before this batch is projected.  The wait below
+                # makes the projection wait for the copies of this batch.
                 ahead = transfer(k + 1) if k + 1 < len(batch_bounds) else None
                 _sharding.wait_for_cylinder_batch(dev, ready)
-                # The first batch allocates the block.  Later batches add into that block
-                # inside the projector's view loop, which saves one allocation per batch.
+                # The first batch allocates the output block, and later batches add into it.
                 if owned is None:
                     owned = pf.sparse_forward_project_view_range(
                         full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
@@ -720,17 +743,14 @@ class TomographyModel(ParameterHandler):
                     pf.sparse_forward_project_view_range(
                         full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
                         dev_index=i, accumulate_into=owned)
-                # The cylinder batch is released once its projection is issued.
                 full_cyl = None
             if owned is None:
-                # With no pixels the device still owes a block for its views,
-                # and that block is zero everywhere.
+                # If there are no pixels, the output block for the views of this device is zero.
                 owned = torch.zeros((v1 - v0, num_rows, num_channels),
                                     dtype=voxel_shards.dtype, device=dev)
             return owned
 
-        # One fan out covers the whole call, so the pixel loop inside the worker issues each
-        # device's transfers from the thread that consumes them.
+        # The thread that uses a transfer to a device also starts that transfer.
         transfer_devices = (list(voxel_shards.placement.devices)
                             + list(sp.devices))
         _sharding.open_copy_streams(transfer_devices)
@@ -739,18 +759,17 @@ class TomographyModel(ParameterHandler):
                 tensors = _sharding.run_per_device(sp.devices, worker,
                                                    executor=pool)
         finally:
-            # The streams are closed even when a worker raises, because copies
-            # already issued are still running and read the shards.
+            # The streams are closed even after an error, because copies in progress still read
+            # the voxel tensors.
             _sharding.close_copy_streams(transfer_devices)
         return _sharding.Shards(tensors, sp)
 
     def _sparse_back_project_sharded(self, sino_shards, pixel_indices,
                                      coeff_power=1):
-        """Run the banded sharded back projection, which is the adjoint of the
-        forward projection.  Every device that owns views back projects them
-        onto each slice band, and the partial results are summed onto the
-        device that owns that band.  A single device placement calls the plain
-        driver."""
+        """This method runs the multi-device back projection.  The method processes the slices
+        in groups.  For each group of slices, every device that holds views back projects its
+        views onto the group.  The method then sums the partial results onto the device that
+        holds the group of slices."""
         if sino_shards.placement.is_trivial:
             return _sharding.Shards(
                 [self.projector_functions._sparse_back_project_single_device(
@@ -765,14 +784,11 @@ class TomographyModel(ParameterHandler):
         fixed_band = getattr(self, 'back_project_slice_band', None)
         with self._band_pool(sp.n_devices) as pool:
             for oi, (odev, (s0, s1)) in enumerate(band_ranges):
-                # The band is streamed in sub-bands, so each partial result and
-                # each gather is the size of a sub-band.
                 band_len = self._slice_band_length(
                     s1 - s0, sp.n_devices, num_pixels, fixed_band)
                 owner_parts = []
                 for (l0, l1) in self._balanced_slice_bounds(s1 - s0, band_len):
-                    # A device that owns no views contributes nothing, so its
-                    # projector call is skipped and it is dropped from the sum.
+                    # A device that holds no views is skipped.
                     if aligned:
                         partials = _sharding.run_per_device(
                             sp.devices,
@@ -800,12 +816,11 @@ class TomographyModel(ParameterHandler):
                     owner_parts.append(_sharding.sum_band_to_owner(
                         [p for p in partials if p is not None], odev,
                         self.dev2dev_safe))
-                    # This release must come before the next band's run_per_device call.
-                    # Without it, this band's partial result stays on every device.
+                    # This release must come before the run_per_device call of the next group.
                     partials = None
                 if not owner_parts:
-                    # A device that owns no slices produced no bands, so the
-                    # dtype and the device are named explicitly here.
+                    # A device with no slices has no partial results, so this code sets the dtype
+                    # and device of its empty output.
                     recon_tensors.append(torch.zeros(
                         (num_pixels, 0), dtype=sino_shards.dtype, device=odev))
                 else:
@@ -818,13 +833,8 @@ class TomographyModel(ParameterHandler):
         return vcd_utils.gen_full_indices(recon_shape, use_ror_mask=use_ror_mask)
 
     def full_index_count(self):
-        """How many pixels the ROR mask keeps, cached per (recon_shape,
-        use_ror_mask).
-
-        The memory ledger reads this once per candidate device layout, and
-        rebuilding the mask each time would repeat a full-grid numpy pass per
-        candidate.  Only the COUNT is cached here; the indices themselves have
-        their own device-resident cache in :meth:`full_indices_device`."""
+        """This method returns the number of pixels that the ROR mask keeps.  The method
+        caches the count for each pair (recon_shape, use_ror_mask)."""
         recon_shape, use_ror_mask = self.get_params(['recon_shape', 'use_ror_mask'])
         key = (tuple(recon_shape),
                use_ror_mask if isinstance(use_ror_mask, bool) else None)
@@ -837,10 +847,10 @@ class TomographyModel(ParameterHandler):
         return self._full_index_count_cache[1]
 
     def full_indices_device(self):
-        """The ROR-masked full pixel indices as an int64 tensor on the model
-        device, cached per (recon_shape, use_ror_mask, device) -- rebuilding
-        per call was a measured cost.  A custom mask array bypasses the cache
-        (unhashable).  In-memory only; freed with the model."""
+        """This method returns the indices of all pixels inside the ROR mask, as an int64
+        tensor on the model device.  The method caches the tensor for each triple
+        (recon_shape, use_ror_mask, device).  The method does not cache the result for a custom
+        mask array."""
         recon_shape, use_ror_mask = self.get_params(['recon_shape', 'use_ror_mask'])
         key = (tuple(recon_shape), use_ror_mask if isinstance(use_ror_mask, bool) else None,
                str(self.torch_device))
@@ -855,10 +865,9 @@ class TomographyModel(ParameterHandler):
         return self._full_indices_cache[1]
 
     def refresh_device_bindings(self):
-        """Recompile hook: rebuild the placements from the CURRENT params
-        (preserving the configured devices), then recreate the projectors.
-        Without this a geometry-changing set_params left the placements'
-        axis lengths stale, silently truncating sharded arrays."""
+        """This method rebuilds the assignment of views and slices to devices from the current
+        parameters.  It keeps the configured devices, and it then rebuilds the projectors.
+        mbirtorch calls this method after any ``set_params`` call that changes the geometry."""
         devices = self.sino_placement.devices
         sinogram_shape, recon_shape = self.get_params(
             ['sinogram_shape', 'recon_shape'])
@@ -872,13 +881,8 @@ class TomographyModel(ParameterHandler):
             self.create_projectors()
 
     def _check_no_empty_shard(self):
-        """Raise an error for a device layout that would leave a device with no
-        views and no slices.
-
-        A device with views but no slices, or slices but no views, still has
-        work to do and is allowed.  A device owns nothing on an axis only when
-        the device count exceeds that axis length, so the rule is a device
-        count above both the view count and the slice count."""
+        """This method raises an error if the chosen devices would leave a device with no views
+        and no slices."""
         sp, rp = self.sino_placement, self.recon_placement
         if sp.axis_len is None or rp.axis_len is None:
             return
@@ -891,41 +895,41 @@ class TomographyModel(ParameterHandler):
                 f'geometry.')
 
     def _invalidate_device_caches(self):
-        """Drop every cache that depends on the device layout or the geometry,
-        so that no consumer reads out of date device state."""
+        """This method clears every cache that depends on the devices or on the geometry."""
         self.prox_data = None
         self._dc_damping_cache = None
 
     # ── device configuration ──────────────────────────────────────────────────
     def configure_devices(self, num_devices=1, devices=None, like=None):
         """
-        Choose the devices the model computes on.
+        This method chooses the devices that the model computes on.
 
-        Give a number of GPUs, a list of devices, or another model to match::
+        The method takes a number of GPUs, a list of devices, or another model to match::
 
             ct_model.configure_devices(2)                             # the first two GPUs
             ct_model.configure_devices(devices=['cuda:0', 'cuda:2'])  # these two GPUs
             ct_model.configure_devices(devices=['cpu'])               # the CPU
             denoiser.configure_devices(like=ct_model)                 # the same devices as ct_model
 
-        Without a call, the model chooses by itself: a GPU when there is one, and on a machine
-        with several GPUs as many as help at the problem size.  A call turns that choice off for
-        this model, so ``configure_devices(1)`` pins a run to one GPU for a reproducible result.
-        Results differ slightly with the number of GPUs, and the difference shrinks as the
-        iterations proceed.
+        If the user does not call this method, the model uses a GPU when there is one.  On a
+        machine with several GPUs, the model uses as many GPUs as speed up a problem of that
+        size.  A call to this method turns off the automatic choice for this model.  For
+        example, ``configure_devices(1)`` keeps a run on one GPU, which gives a reproducible
+        result.  The results differ slightly with the number of GPUs.
 
-        ``like=`` is for a Plug-and-Play loop that passes a volume between a reconstruction model
-        and a denoiser: on the same devices the volume stays on the GPUs between the two.
-        Configure the other model first.
+        The argument ``like=`` lets a Plug-and-Play loop pass a volume between a reconstruction
+        model and a denoiser while the volume stays on the GPUs.  The user must configure the
+        other model first.
 
-        Call this after any change to the sinogram or reconstruction shape.
+        The user must call this method again after any change to the sinogram shape or the
+        reconstruction shape.
 
         Args:
-            num_devices (int, optional): number of GPUs.  Defaults to 1.
-            devices (list, optional): device names, such as ``['cuda:0', 'cuda:1']`` or ``['cpu']``.
-                Overrides num_devices.
-            like (TomographyModel, optional): a model whose devices this model copies.  The two
-                must have the same recon shape.
+            num_devices (int, optional): The number of GPUs.  Defaults to 1.
+            devices (list, optional): The device names, such as ``['cuda:0', 'cuda:1']`` or
+                ``['cpu']``.  This argument overrides ``num_devices``.
+            like (TomographyModel, optional): A model whose devices this model copies.  The two
+                models must have the same recon shape.
         """
         if like is not None and devices is not None:
             raise ValueError(
@@ -933,11 +937,10 @@ class TomographyModel(ParameterHandler):
                 "copies another model's device list, and devices= names one "
                 'directly.  Pass whichever one expresses the intent.')
         self.device_layout_is_automatic = False
-        # The rejected counts and the settled record belong to the automatic search.  An
-        # explicit layout did not come from that search, so they are cleared here.
+        # The user chose the devices, so the records of the automatic choice are cleared.
         self.device_choice_rejections = []
-        self._settled_shapes = None
-        self._settled_workload = None
+        self._device_choice_shapes = None
+        self._device_choice_workload = None
         if like is not None:
             devices = self._devices_like(like)
         if devices is None:
@@ -954,13 +957,8 @@ class TomographyModel(ParameterHandler):
         self._install_device_layout(devices)
 
     def _devices_like(self, other):
-        """Return the device list of ``other``, after checking that this model
-        can exchange reconstruction arrays with it.
-
-        The check catches a second model built at the wrong shape, such as a
-        denoiser built at a CT model's sinogram shape instead of its
-        reconstruction shape.
-        """
+        """This method returns the device list of ``other``.  It first checks that this model
+        and ``other`` can exchange reconstruction arrays."""
         placement = getattr(other, 'recon_placement', None)
         other_get_params = getattr(other, 'get_params', None)
         if not isinstance(placement, _sharding.Placement) \
@@ -991,9 +989,8 @@ class TomographyModel(ParameterHandler):
         return list(placement.devices)
 
     def _install_device_layout(self, devices):
-        """Rebuild the placements over ``devices``.  Both
-        :meth:`~mbirtorch.TomographyModel.configure_devices` and the automatic choice call this.  It does
-        not change ``device_layout_is_automatic``."""
+        """This method assigns the views and the slices to ``devices``.  It does not change
+        ``device_layout_is_automatic``."""
         devices = [torch.device(d) for d in devices]
         self.torch_device = devices[0]
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
@@ -1002,212 +999,185 @@ class TomographyModel(ParameterHandler):
         self.recon_placement = _sharding.Placement(
             devices, axis=-1, axis_len=int(recon_shape[2]))
         self._check_no_empty_shard()
-        # This probes whether a direct copy between devices is correct on this
-        # hardware.  When it is not, transfers go through host memory.
+        # Direct copies between devices are used only if they are correct on this hardware.
         self.dev2dev_safe = _sharding.is_dev2dev_safe(devices)
         self._invalidate_device_caches()
         if self._projector_functions is not None:
             self.create_projectors()
 
-    # ── the memory ledger and the automatic device count ──────────────────────
-    def _build_memory_ledger(self, devices=None, workload='recon',
-                             **call_arrays):
-        """Return the modeled peak memory per device for one candidate device
-        list.  A value of None for ``devices`` means the current placement.
-        The argument ``workload`` names the call, either 'recon' or 'direct'.
-        """
+    # ── memory estimates and the automatic device count ───────────────────────
+    def _estimate_memory(self, devices=None, workload='recon',
+                         **call_arrays):
+        """This method returns the estimated peak memory of each device for a list of devices.
+        If ``devices`` is None, it uses the current devices.  The argument ``workload`` is
+        'recon' or 'direct'."""
 
         devices = list(self.sino_placement.devices if devices is None
                        else devices)
-        return _memory_ledger.estimate_peak_device_bytes(
-            _memory_ledger.plan_from_model(self, devices, workload=workload,
-                                           **call_arrays))
+        return _memory_estimate.estimate_peak_device_bytes(
+            _memory_estimate.plan_from_model(self, devices, workload=workload,
+                                             **call_arrays))
 
     def _candidate_devices(self, num_devices):
         return [torch.device(f'cuda:{i}') for i in range(num_devices)]
 
     def _shape_pair(self):
-        """Return the (sinogram_shape, recon_shape) pair.  The automatic policy
-        records this pair when it settles and compares it on every later call.
-        The memory ledger's plan is built from these two shapes."""
+        """This method returns the (sinogram_shape, recon_shape) pair."""
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
                                                        'recon_shape'])
         return tuple(sinogram_shape), tuple(recon_shape)
 
     def _apply_device_policy(self, workload='recon', **call_arrays):
-        """Settle the device layout for the reconstruction about to run, and
-        return the ledger for the layout settled on.
-
-        ``workload`` names the call in progress.  It is ``'recon'`` for a full
-        reconstruction, ``'direct'`` for a direct reconstruction, and
-        ``'denoise'`` for one QGGMRFDenoiser sweep.  It tells the ledger what
-        is about to be allocated.
-
-        This is the only place where the automatic device count is chosen.  The
-        choice happens when a reconstruction starts, because the free memory
-        reading is current only then.  The choice is made once per model, and
-        the search runs again only when the sinogram or reconstruction shape
-        changes.  The widening speed floors set the order in which candidate
-        counts are tried, and capacity wins when no admitted count fits.
+        """This method chooses the GPUs for the reconstruction that is about to run, and it
+        returns the memory estimate for those GPUs.  It chooses the GPUs once per model, and
+        again when the shapes change.  The argument ``workload`` is ``'recon'``, ``'direct'``,
+        ``'forward'``, ``'back'``, or ``'denoise'``.
         """
-        calibrating = _memory_ledger.calibration_enabled()
-        # A candidate layout is sized for the largest workload this model may ever run.  That is a
-        # full reconstruction, except on a QGGMRFDenoiser, which can only denoise.
+        calibrating = _memory_estimate.calibration_enabled()
+        # The devices are chosen for a full reconstruction.  A denoiser is the exception,
+        # because it only denoises.
         sizing = 'denoise' if workload == 'denoise' else 'recon'
         if not self.device_layout_is_automatic:
-            # The ledger runs on an explicit layout only when calibration asks
-            # for it.
-            ledger = self._build_memory_ledger(workload=sizing,
-                                               **call_arrays) \
+            # When the user chose the devices, the memory estimate runs only for calibration.
+            estimate = self._estimate_memory(workload=sizing,
+                                             **call_arrays) \
                 if calibrating else None
-            return self._arm_calibration(ledger, sizing)
+            return self._record_memory_estimate(estimate, sizing)
 
-        if self._settled_shapes is not None:
-            if self._settled_shapes == self._shape_pair():
-                if _memory_ledger.workload_covers(self._settled_workload,
-                                                  workload):
-                    # The settled check already covers this call, so the layout
-                    # is reused without a search.
-                    ledger = self._build_memory_ledger(workload=sizing,
-                                                       **call_arrays) \
+        if self._device_choice_shapes is not None:
+            if self._device_choice_shapes == self._shape_pair():
+                if _memory_estimate.workload_covers(self._device_choice_workload,
+                                                    workload):
+                    # The earlier memory check covers this call, so the same devices are reused.
+                    estimate = self._estimate_memory(workload=sizing,
+                                                     **call_arrays) \
                         if calibrating else None
-                    return self._arm_calibration(ledger, sizing)
-                # This call allocates more than the settled check priced, so the check runs
-                # again on the settled layout, which does not move.
-                ledger = self._check_settled_capacity(workload, call_arrays)
-                # The check passed, so the record now names the workload the layout is known
-                # to hold, and a later call of the same kind repeats no check.
-                self._settled_workload = workload
-                return self._arm_calibration(ledger, sizing)
-            # The shapes changed, so the settled decision is dropped and the
-            # layout is decided again below.
-            self._settled_shapes = None
-            self._settled_workload = None
+                    return self._record_memory_estimate(estimate, sizing)
+                # This call needs more memory than the earlier check assumed, so the check runs
+                # again.
+                estimate = self._recheck_memory_for_chosen_devices(workload, call_arrays)
+                self._device_choice_workload = workload
+                return self._record_memory_estimate(estimate, sizing)
+            self._device_choice_shapes = None
+            self._device_choice_workload = None
 
-        pinned = _memory_ledger.pinned_device_count()
+        env_count = _memory_estimate.env_device_count()
         visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
         if visible < 2:
-            # There is no layout to choose.  The allocator's own error covers
-            # an overflow on a single device.
-            return self._arm_calibration(None, sizing)
+            # There is no choice to make.  On one device, the allocator reports any lack of
+            # memory.
+            return self._record_memory_estimate(None, sizing)
 
-        if pinned is not None:
-            # A pin that applies to the whole process is as explicit as a
-            # configure_devices call, so the count is used as given.
-            candidates, held = [min(pinned, visible)], {}
+        if env_count is not None:
+            # If the environment sets the device count for the process, that count is used.
+            candidates, held = [min(env_count, visible)], {}
         else:
             candidates, held = self._speed_ordered_candidates(visible)
 
         rejected, best = [], None
-        self._speed_floor_fallback = None
-        self._speed_floor_held = held
+        self._size_limit_fallback = None
+        self._size_limit_held = held
         for count in candidates:
             if count in held:
-                # Admitted counts come first, so reaching a held count means
-                # capacity is about to override the speed rule.
+                # The sinogram is below the minimum size for this count.  The count is tried only
+                # because larger counts did not fit in memory.
                 held_note, taken_note = held[count]
                 rejected.append((count, held_note))
-                self._speed_floor_fallback = (count, taken_note)
+                self._size_limit_fallback = (count, taken_note)
             devices = (self._candidate_devices(count) if count > 1
                        else [self.torch_device])
             if not self._layout_is_valid(devices):
                 rejected.append((count, 'a device would own no real data'))
                 continue
-            # The price is taken at the sizing workload, whatever this call is, because the
-            # count chosen here has to suit the largest workload the model may later run.
-            ledger = self._build_memory_ledger(devices=devices,
-                                               workload=sizing, **call_arrays)
-            if ledger is None or self.skip_memory_preflight:
-                # There is nothing to check against, or the caller has forced
-                # the run.
-                return self._settle(devices, ledger, rejected, sizing)
-            fits, rows = self._layout_capacity(devices, ledger, call_arrays)
+            # The memory estimate is for the largest task that the model may run later.
+            estimate = self._estimate_memory(devices=devices,
+                                             workload=sizing, **call_arrays)
+            if estimate is None or self.skip_memory_check:
+                # Either there is no memory limit to check, or the caller turned off the check.
+                return self._use_chosen_devices(devices, estimate, rejected, sizing)
+            fits, rows = self._layout_capacity(devices, estimate, call_arrays)
             if fits:
-                return self._settle(devices, ledger, rejected, sizing)
+                return self._use_chosen_devices(devices, estimate, rejected, sizing)
             shortfall = max((d - b) for _dev, d, b in rows if b is not None)
             rejected.append((count, f'{shortfall / 2 ** 30:.2f} GB short'))
             if best is None or shortfall < best[0]:
-                best = (shortfall, ledger, rows, count)
+                best = (shortfall, estimate, rows, count)
 
         if workload != sizing and best is not None:
-            # No count fits the sizing workload, and this call is not running one.  The candidates
-            # are tried again in the same order, priced against the call in progress instead.
+            # No count fits the largest task.  For this reason, the counts are tried again with
+            # the memory that this call needs.
             best = None
             for count in candidates:
                 devices = (self._candidate_devices(count) if count > 1
                            else [self.torch_device])
                 if not self._layout_is_valid(devices):
                     continue
-                ledger = self._build_memory_ledger(
+                estimate = self._estimate_memory(
                     devices=devices, workload=workload, **call_arrays)
-                fits, rows = self._layout_capacity(devices, ledger,
+                fits, rows = self._layout_capacity(devices, estimate,
                                                    call_arrays)
                 if fits:
-                    # The first pass recorded this count as refused, priced for a
-                    # reconstruction this call is not running.  That record is removed.
-                    self._speed_floor_fallback = None
+                    # The first loop rejected this count for a task that this call does not run.
+                    self._size_limit_fallback = None
                     rejected = [(c, why) for c, why in rejected
                                 if c != count]
                     rejected.append(
                         (count, f'chosen for the {workload} reconstruction '
                                 'in progress: no device count fits a full '
                                 'recon at this size'))
-                    return self._settle(devices, ledger, rejected, workload)
+                    return self._use_chosen_devices(devices, estimate, rejected, workload)
                 shortfall = max((d - b) for _dev, d, b in rows if b is not None)
                 if best is None or shortfall < best[0]:
-                    best = (shortfall, ledger, rows, count)
+                    best = (shortfall, estimate, rows, count)
 
-        # No device count fits, including a single device.  The call fails here
-        # rather than start a reconstruction that is known not to fit.
+        # No device count fits.  The call raises an error before the reconstruction starts.
         if best is None:
-            raise _memory_ledger.MemoryPreflightError(
+            raise _memory_estimate.MemoryCheckError(
                 'no device layout is valid for this geometry: '
                 + '; '.join(f'{c} devices ({why})' for c, why in rejected))
-        _shortfall, ledger, rows, count = best
-        raise _memory_ledger.MemoryPreflightError(
-            _memory_ledger.format_shortfall(
-                ledger, rows, num_devices_tried=candidates,
+        _shortfall, estimate, rows, count = best
+        raise _memory_estimate.MemoryCheckError(
+            _memory_estimate.format_shortfall(
+                estimate, rows, num_devices_tried=candidates,
                 closest_count=count, remedies=self._memory_remedies()))
 
     def _speed_ordered_candidates(self, visible):
-        """Return the order in which to try candidate device counts, along with
-        the notes for the counts the widening speed floors hold back.
-
-        The floors reorder the counts and never remove one.  Admitted counts
-        come first, largest first, then the held counts, also largest first.
-        Capacity therefore always wins.
+        """This method returns the order in which to try the device counts.  The counts for
+        which the sinogram meets the minimum size in ``_min_problem_sizes`` come first, from
+        largest to smallest.  The other counts come after them.
 
         Returns:
-            (list, dict): candidate counts in the order to try them, and
-            ``{count: (held_note, taken_note)}`` for the held ones.
+            (list, dict): The device counts in the order to try them, and a dict
+            ``{count: (held_note, taken_note)}`` for the counts below their minimum size.
         """
         candidates = list(range(visible, 0, -1))
-        if not _widening_floors.guard_enabled():
+        if not _min_problem_sizes.size_limit_enabled():
             return candidates, {}
-        elements = _widening_floors.sinogram_elements(
+        elements = _min_problem_sizes.sinogram_elements(
             self.get_params('sinogram_shape'))
-        family = self._floor_family
-        note = _widening_floors.stale_note()
+        family = self._size_table_key
+        note = _min_problem_sizes.stale_note()
         if note is not None:
             self.logger.info('Note: ' + note + '.')
         if family is None and self.get_params('verbose') >= 2:
             self.logger.debug(
-                f'  {type(self).__name__} names no _floor_family, so the '
-                f'{_widening_floors.DEFAULT_FAMILY} widening speed floors '
+                f'  {type(self).__name__} sets no _size_table_key, so the '
+                f'{_min_problem_sizes.DEFAULT_FAMILY} minimum problem sizes '
                 f'apply to its automatic device count.')
-        admitted, held = [], {}
+        allowed_counts, held = [], {}
         for count in candidates:
-            ok, why = _widening_floors.admitted(family, count, elements)
+            ok, why = _min_problem_sizes.allowed(family, count, elements)
             if ok:
-                admitted.append(count)
+                allowed_counts.append(count)
             else:
-                held[count] = (why, _widening_floors.fallback_reason(
+                held[count] = (why, _min_problem_sizes.fallback_reason(
                     family, count, elements))
-        # A count of 1 is always admitted, so the admitted list is never empty.
-        return admitted + list(held), held
+        # One device is always allowed, so the list is never empty.
+        return allowed_counts + list(held), held
 
     def _memory_remedies(self):
-        """Extra remedy lines for this geometry's preflight message."""
+        """This method returns extra suggestion lines for the error message that this geometry
+        gives when the reconstruction does not fit in memory."""
         if type(self).recon_split_sino is not TomographyModel.recon_split_sino:
             return ['  model.recon_split_sino(...)                '
                     '# reconstructs one row band at a time; raises',
@@ -1216,48 +1186,39 @@ class TomographyModel(ParameterHandler):
         return []
 
     def _layout_is_valid(self, devices):
-        """Return True when ``devices`` passes the rule that
-        :meth:`_check_no_empty_shard` applies.  Nothing is changed."""
+        """This method returns True if ``devices`` passes the test in
+        :meth:`_check_no_empty_shard`."""
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
                                                        'recon_shape'])
         return len(devices) <= max(int(sinogram_shape[0]), int(recon_shape[2]))
 
-    def _layout_capacity(self, devices, ledger, call_arrays):
-        """Return whether the modeled peak in ``ledger`` fits ``devices``,
-        along with the rows used to report it.  This is the only place where a
-        memory budget is compared with a modeled demand."""
-        budgets = [_memory_ledger.device_budget_bytes(d) for d in devices]
-        credits = _memory_ledger.resident_credits(
+    def _layout_capacity(self, devices, estimate, call_arrays):
+        """This method returns True if the estimated peak memory in ``estimate`` fits on
+        ``devices``.  It also returns the table rows that an error message uses to report the
+        result."""
+        budgets = [_memory_estimate.device_budget_bytes(d) for d in devices]
+        bytes_already_on_devices = _memory_estimate.bytes_already_on_devices(
             devices, list(call_arrays.values()))
-        return _memory_ledger.layout_fits(
-            ledger, budgets, credits, margin=self.memory_preflight_margin)
+        return _memory_estimate.layout_fits(
+            estimate, budgets, bytes_already_on_devices, margin=self.memory_check_margin)
 
     def _fits_available_devices(self, workload='recon', **call_arrays):
-        """Return whether the modeled peak for ``workload`` fits any device
-        layout this model could run on.  Nothing is changed and no memory is
-        allocated, so a caller can price a model it is about to discard.
-
-        The candidate device lists are the ones the policy would try.  The
-        order does not matter to a yes or no answer, so the widening speed
-        floors are not consulted.  A device with no readable memory budget,
-        meaning anything other than CUDA, is treated as holding whatever it is
-        asked to hold.
-
-        Returns:
-            bool: True when some candidate layout holds the modeled peak.
+        """This method returns True if the estimated peak memory for ``workload`` fits on some
+        set of devices that this model could use.  The method treats a device other than a CUDA
+        device as having unlimited memory.
         """
-        if self.skip_memory_preflight:
+        if self.skip_memory_check:
             return True
         if not self.device_layout_is_automatic:
             candidates = [list(self.sino_placement.devices)]
         else:
-            pinned = _memory_ledger.pinned_device_count()
+            env_count = _memory_estimate.env_device_count()
             visible = (torch.cuda.device_count() if torch.cuda.is_available()
                        else 0)
             if visible < 2:
                 counts = [1]
-            elif pinned is not None:
-                counts = [min(pinned, visible)]
+            elif env_count is not None:
+                counts = [min(env_count, visible)]
             else:
                 counts = list(range(visible, 0, -1))
             candidates = [self._candidate_devices(count) if count > 1
@@ -1265,97 +1226,111 @@ class TomographyModel(ParameterHandler):
         for devices in candidates:
             if not self._layout_is_valid(devices):
                 continue
-            ledger = self._build_memory_ledger(devices=devices,
-                                               workload=workload,
-                                               **call_arrays)
-            if ledger is None:
+            estimate = self._estimate_memory(devices=devices,
+                                             workload=workload,
+                                             **call_arrays)
+            if estimate is None:
                 return True
-            fits, _rows = self._layout_capacity(devices, ledger, call_arrays)
+            fits, _rows = self._layout_capacity(devices, estimate, call_arrays)
             if fits:
                 return True
         return False
 
-    def _check_settled_capacity(self, workload, call_arrays):
-        """Run the capacity check for ``workload`` on the settled layout, and
-        return the ledger it priced.
-
-        The layout does not change, because a caller may be holding shards of
-        it.  This check can refuse the call.  Without it, a model that settled
-        under a direct reconstruction would reach the allocator on a later full
-        reconstruction with no preflight message or remedies.
+    def _recheck_memory_for_chosen_devices(self, workload, call_arrays):
+        """This method runs the memory check for ``workload`` on the chosen GPUs, and it
+        returns the memory estimate.  The method does not change the devices.
         """
-        if self.skip_memory_preflight:
-            # The caller has forced the run.
+        if self.skip_memory_check:
+            # The caller has turned off the memory check.
             return None
         devices = list(self.sino_placement.devices)
-        ledger = self._build_memory_ledger(devices=devices, workload=workload,
-                                           **call_arrays)
-        fits, rows = self._layout_capacity(devices, ledger, call_arrays)
+        estimate = self._estimate_memory(devices=devices, workload=workload,
+                                         **call_arrays)
+        fits, rows = self._layout_capacity(devices, estimate, call_arrays)
         if fits:
-            return ledger
-        raise _memory_ledger.MemoryPreflightError(
-            _memory_ledger.format_shortfall(
-                ledger, rows, num_devices_tried=[len(devices)],
+            return estimate
+        raise _memory_estimate.MemoryCheckError(
+            _memory_estimate.format_shortfall(
+                estimate, rows, num_devices_tried=[len(devices)],
                 closest_count=len(devices),
                 remedies=self._memory_remedies()))
 
-    def _settle(self, devices, ledger, rejected, workload='recon'):
-        """Install the chosen layout when it differs from the current one, log
-        the choice, and enable the calibration mode.
-
-        ``workload`` is the plan ``ledger`` was priced with, which is the
-        workload the settled layout has been checked for."""
+    def _use_chosen_devices(self, devices, estimate, rejected, workload='recon'):
+        """This method switches the model to the chosen devices if they differ from the current
+        devices.  It also logs the choice and records the memory estimate."""
         chosen, current = len(devices), self.sino_placement.n_devices
-        # When the search settled on a held count, capacity overrode the speed
-        # floor, so the note recorded for that count is replaced.
-        fallback = getattr(self, '_speed_floor_fallback', None)
+        # If the chosen count is below its minimum sinogram size, the log says that memory decided
+        # the choice.
+        fallback = getattr(self, '_size_limit_fallback', None)
         if fallback is not None and fallback[0] == chosen:
             rejected = [fallback if count == chosen else (count, why)
                         for count, why in rejected]
-        # Every larger count the floors held back is named in the log, so that
-        # idle GPUs are explained.
-        held = getattr(self, '_speed_floor_held', None) or {}
+        # The log names the larger counts that were not used, to explain idle GPUs.
+        held = getattr(self, '_size_limit_held', None) or {}
         rejected = list(rejected)
         already = {count for count, _why in rejected}
         for count in sorted(held, reverse=True):
             if count > chosen and count not in already:
                 rejected.append((count, held[count][0]))
-        self._speed_floor_fallback = None
-        self._speed_floor_held = None
-        # The run log's device line reads this to explain any idle GPUs.
+        self._size_limit_fallback = None
+        self._size_limit_held = None
+        # The run log reads this to explain any idle GPUs.
         self.device_choice_rejections = list(rejected)
         if chosen != current:
             self.logger.info(
                 f'Using {chosen} CUDA device(s) for this reconstruction '
-                f'(was {current}).  configure_devices(num_devices=n) pins it.')
+                f'(was {current}).  configure_devices(num_devices=n) fixes it.')
             self._install_device_layout(devices)
         if rejected and self.get_params('verbose') >= 2:
             for count, why in rejected:
                 self.logger.debug(f'  device count {count} rejected: {why}')
-        # These are the shapes this decision came from.  While they hold, later policy calls
-        # reuse the layout.  The workload recorded beside them is what the capacity check used.
-        self._settled_shapes = self._shape_pair()
-        self._settled_workload = workload
-        return self._arm_calibration(ledger, workload)
+        # Later calls reuse these devices while the shapes stay the same.
+        self._device_choice_shapes = self._shape_pair()
+        self._device_choice_workload = workload
+        return self._record_memory_estimate(estimate, workload)
 
-    def _arm_calibration(self, ledger, workload='recon'):
-        """Record the ledger for a test harness to read.  Under the calibration
-        mode, build one when the caller had none, so that a policy return
-        always carries a ledger.  The argument ``workload`` names the plan to
-        build that missing ledger with."""
-        if ledger is not None:
-            self.last_memory_ledger = ledger
-        if _memory_ledger.calibration_enabled() and ledger is None:
-            ledger = self._build_memory_ledger(workload=workload)
-            self.last_memory_ledger = ledger
-        return ledger
+    def _record_memory_estimate(self, estimate, workload='recon'):
+        """This method stores the memory estimate for the tests to read.  In calibration mode,
+        it computes an estimate if the caller has none."""
+        if estimate is not None:
+            self.last_memory_estimate = estimate
+        if _memory_estimate.calibration_enabled() and estimate is None:
+            estimate = self._estimate_memory(workload=workload)
+            self.last_memory_estimate = estimate
+        return estimate
 
-    # Every sinogram array is placed by _shard_sinogram and every reconstruction array by
-    # _shard_recon.  The matching gather functions bring them back to the host.
+    # ── deprecated attribute names ────────────────────────────────────────────
+    @property
+    def skip_memory_preflight(self):
+        """This property is the deprecated name of ``skip_memory_check``."""
+        _warn_deprecated_name('skip_memory_preflight', 'skip_memory_check')
+        return self.skip_memory_check
+
+    @skip_memory_preflight.setter
+    def skip_memory_preflight(self, value):
+        _warn_deprecated_name('skip_memory_preflight', 'skip_memory_check')
+        self.skip_memory_check = value
+
+    @property
+    def memory_preflight_margin(self):
+        """This property is the deprecated name of ``memory_check_margin``."""
+        _warn_deprecated_name('memory_preflight_margin', 'memory_check_margin')
+        return self.memory_check_margin
+
+    @memory_preflight_margin.setter
+    def memory_preflight_margin(self, value):
+        _warn_deprecated_name('memory_preflight_margin', 'memory_check_margin')
+        self.memory_check_margin = value
+
+    @property
+    def last_memory_ledger(self):
+        """This property is the deprecated name of ``last_memory_estimate``."""
+        _warn_deprecated_name('last_memory_ledger', 'last_memory_estimate')
+        return self.last_memory_estimate
+
     def _shard_sinogram(self, sinogram):
-        """Place a sinogram or a weights array in its device form.  The result
-        is float32, its view axis is checked, and on a multi-device placement
-        it is sharded by view."""
+        """This method copies a sinogram or a weights array to the devices as float32.  On
+        several devices, the method splits the array by view."""
         num_views = self.get_params('sinogram_shape')[0]
         if isinstance(sinogram, _sharding.Shards):
             if sinogram.placement != self.sino_placement:
@@ -1376,36 +1351,36 @@ class TomographyModel(ParameterHandler):
         return self._split_to_shards(sinogram, self.sino_placement, num_views,
                                      what='sinogram (view axis)')
 
-    # This is True when detector row r corresponds to reconstruction slice r, as it does in
-    # parallel beam.  The base value is False, so a geometry must declare the row aligned path.
+    # This is True when detector row r maps to reconstruction slice r, as in parallel beam.
     rows_track_slices = False
 
-    # This is the fewest pixels the compiled projection bodies may be called
-    # with.  Narrower calls are padded outside the compiled region.
+    # This is the smallest number of pixels that the compiled projection functions accept.
+    # Calls with fewer pixels are padded before the call.
     min_compiled_pixel_width = 1
 
-    # This names the set of measured widening floors that governs the automatic
-    # device count.  None means the parallel beam floors.
-    _floor_family = None
+    # This names the model type in the table of minimum sinogram sizes per device count.  None
+    # means parallel beam.
+    _size_table_key = None
 
     def prepare_sino_for_devices(self, sinogram, weights=None):
         """
-        Send a sinogram (and optionally weights) to the model's devices once.
+        This method copies a sinogram, and optionally its weights, to the devices of the model.
 
-        Every reconstruction method does this by itself.  Call it when you reconstruct the same
-        large sinogram several times, and pass what it returns to :meth:`recon` or
-        :meth:`prox_map` in place of the sinogram; the copy to the GPUs then happens once.
-        Call it again after any change to the devices.
+        Every reconstruction method copies the sinogram by itself.  This method is useful when
+        the user reconstructs one large sinogram several times.  The user passes the result of
+        this method to :meth:`recon` or :meth:`prox_map` in place of the sinogram.  In this way,
+        the copy to the GPUs happens only once.  The user must call this method again after any
+        change to the devices.
 
         Args:
-            sinogram (numpy or tensor): sinogram in the model's sinogram_shape.
-            weights (numpy or tensor, optional): weights of the same shape.
+            sinogram (numpy or tensor): The sinogram, with the shape ``sinogram_shape`` of the
+                model.
+            weights (numpy or tensor, optional): The weights, with the same shape.
 
         Returns:
-            The prepared sinogram, or a (sinogram, weights) tuple when weights were given.
+            The prepared sinogram, or the tuple (sinogram, weights) if weights were given.
         """
-        # The layout is settled before the sinogram is placed.  Placing first would put the
-        # whole sinogram on the lead device and then move it again.
+        # The GPUs are chosen before the sinogram is placed on the devices.
         self._apply_device_policy(workload='direct')
         sino = self._shard_sinogram(sinogram)
         if weights is None:
@@ -1413,15 +1388,13 @@ class TomographyModel(ParameterHandler):
         return sino, self._shard_sinogram(weights)
 
     def _shard_recon(self, recon):
-        """Place a reconstruction array in its device form.  The array is
-        either three dimensional or flat with shape (num_pixels, num_slices).
-        The result is float32, its slice axis is checked, and on a
-        multi-device placement it is sharded by slice."""
+        """This method copies a reconstruction array to the devices as float32.  The array is
+        either 3D or flat with shape (num_pixels, num_slices).  On several devices, the method
+        splits the array by slice."""
         num_slices = self.get_params('recon_shape')[2]
         if isinstance(recon, _sharding.Shards):
-            # Placements compare by value, so shards made by another model on the same
-            # devices with the same slice count are accepted.  No check of the whole volume shape
-            # belongs here, because sparse_forward_project sends subsets of the pixels through it.
+            # Placements compare by value, so the method accepts shards from another model on the
+            # same devices.
             if recon.placement != self.recon_placement:
                 raise ValueError(
                     'Recon shards belong to a different device '
@@ -1441,10 +1414,8 @@ class TomographyModel(ParameterHandler):
                                      what='reconstruction (slice axis)')
 
     def _split_to_shards(self, x, placement, axis_len, what='array'):
-        """Split an array into one shard tensor per device.  Each device gets a
-        contiguous block of the sharded axis.  The blocks differ in length by
-        at most one.  A device count above the axis length leaves the trailing
-        devices with empty blocks."""
+        """This method splits an array into one contiguous block per device.  The lengths of
+        the blocks differ by at most one."""
         x = torch.as_tensor(x, dtype=torch.float32)
         axis = placement.axis % x.ndim
         if x.shape[axis] != axis_len:
@@ -1459,8 +1430,8 @@ class TomographyModel(ParameterHandler):
         return _sharding.Shards(tensors, placement)
 
     def _gather_sinogram(self, sinogram):
-        """Return a sinogram-like array as a host numpy array, with the
-        shards concatenated on the view axis."""
+        """This method returns a sinogram-shaped array as a numpy array in host memory.  It
+        concatenates the shards along the view axis."""
         if isinstance(sinogram, _sharding.Shards):
             out = self._gather_shards(sinogram)
         else:
@@ -1468,8 +1439,8 @@ class TomographyModel(ParameterHandler):
         return out
 
     def _gather_recon(self, recon):
-        """Return a recon-like array as a host numpy array, with the shards
-        concatenated on the slice axis."""
+        """This method returns a recon-shaped array as a numpy array in host memory.  It
+        concatenates the shards along the slice axis."""
         if isinstance(recon, _sharding.Shards):
             out = self._gather_shards(recon)
         else:
@@ -1477,8 +1448,8 @@ class TomographyModel(ParameterHandler):
         return out
 
     def _constant_recon(self, value):
-        """Return a reconstruction of constant value in the device form.  It is
-        built one shard at a time, so no full volume lands on one device."""
+        """This method returns a reconstruction with a constant value on the devices.  It builds
+        the reconstruction one shard at a time."""
         recon_shape = self.get_params('recon_shape')
         if self.recon_placement.is_trivial:
             recon = torch.full(tuple(recon_shape), float(value),
@@ -1493,19 +1464,18 @@ class TomographyModel(ParameterHandler):
 
     def _initial_error_state(self, sinogram, init_recon, weights,
                              constant_weights, scale_recon_to_sinogram):
-        """Return the initial (error_sinogram, init_recon) pair.  The initial
-        reconstruction is forward projected, the optimal scale alpha is found,
-        and both arrays are scaled by it."""
+        """This method returns the initial pair (error_sinogram, init_recon).  Both are scaled
+        by the scale factor alpha that best fits the projection to the sinogram."""
         self.logger.info('Initializing error sinogram')
-        fwd = self.forward_project(init_recon, output_sharded=True)
+        fwd = self._forward_project(init_recon, output_sharded=True)
         if isinstance(fwd, _sharding.Shards):
             def dots_worker(i, d):
-                # Both sums are reduced one block of views at a time, so the shard never
-                # holds a weighted projection or a full array of products.
+                # The sums run over one block of views at a time, so no full array of products
+                # is formed.
                 f = fwd.tensors[i]
                 w = None if constant_weights else weights.tensors[i]
-                return (float(_memory_ledger.weighted_square_sum(f, w)),
-                        float(_memory_ledger.weighted_dot(
+                return (float(_memory_estimate.weighted_square_sum(f, w)),
+                        float(_memory_estimate.weighted_dot(
                             f, sinogram.tensors[i], w)))
             dots = _sharding.run_per_device(self.sino_placement.devices,
                                             dots_worker)
@@ -1514,43 +1484,35 @@ class TomographyModel(ParameterHandler):
                 alpha = sum(b for _, b in dots) / wtd_err_sino_norm
             else:
                 alpha = 1
-            # The error is formed in the projection's own shards.  Scaling a shard by minus alpha
-            # and adding the sinogram gives sinogram - alpha * fwd, and allocates nothing.
+            # The error sinogram, sinogram - alpha * fwd, is computed in place in the shards of
+            # the projection.
             error_sinogram = _sharding.Shards(
                 _sharding.run_per_device(
                     self.sino_placement.devices,
                     lambda i, d: fwd.tensors[i].mul_(-alpha).add_(
                         sinogram.tensors[i])),
                 self.sino_placement)
-            # The projection's shards now hold the error sinogram, so dropping
-            # this name releases only the container.
             fwd = None
             init_recon = _sharding.Shards(
                 [alpha * t for t in init_recon.tensors], self.recon_placement)
         else:
-            # The reduction runs one block of views at a time, as in the
-            # sharded branch above.
             w = None if constant_weights else weights
-            wtd_err_sino_norm = _memory_ledger.weighted_square_sum(fwd, w)
+            wtd_err_sino_norm = _memory_estimate.weighted_square_sum(fwd, w)
             if wtd_err_sino_norm > 0 and scale_recon_to_sinogram:
-                alpha = (_memory_ledger.weighted_dot(fwd, sinogram, w)
+                alpha = (_memory_estimate.weighted_dot(fwd, sinogram, w)
                          / wtd_err_sino_norm).item()
             else:
                 alpha = 1
-            # The error is formed in the projection's own buffer, as in the
-            # sharded branch above.
             error_sinogram = fwd.mul_(-alpha).add_(sinogram)
             fwd = None
             init_recon = alpha * init_recon
         return error_sinogram, init_recon
 
     def _flatten_recon(self, recon):
-        """Return the reconstruction in the VCD loop's flat
-        (num_pixels, slices) layout, made contiguous for the in place row
-        updates."""
+        """This method returns the reconstruction as a contiguous flat array with shape
+        (num_pixels, slices), which is the form that the VCD loop uses."""
         if isinstance(recon, _sharding.Shards):
-            # The row count is named rather than inferred, because reshape
-            # cannot infer it from a shard that owns no slices.
+            # reshape cannot infer the number of rows of a shard that holds no slices.
             flat = _sharding.Shards(
                 [t.reshape((math.prod(t.shape[:-1]), t.shape[-1])).contiguous()
                  for t in recon.tensors], recon.placement)
@@ -1560,14 +1522,9 @@ class TomographyModel(ParameterHandler):
         return flat
 
     def _flatten_prox_shards(self, prox_input, recon_shape):
-        """Bring a prox input that is already in the device form into the VCD
-        loop's flat (num_pixels, local_slices) layout, without going through
-        host memory.
-
-        The shards together must cover the full pixel grid and the full slice
-        axis, and that is checked here.  Each shard is either three dimensional
-        with shape (rows, cols, local_slices) or already flat with shape
-        (num_pixels, local_slices).  A shard that owns no slices is allowed.
+        """This method converts a prox input that is already on the devices to the flat form
+        (num_pixels, local_slices) that the VCD loop uses.  It does not copy the data through
+        host memory.  It first checks that the shards cover the full pixel grid and all slices.
         """
         rows, cols, num_slices = (int(recon_shape[0]), int(recon_shape[1]),
                                   int(recon_shape[2]))
@@ -1593,20 +1550,14 @@ class TomographyModel(ParameterHandler):
                 'local_slices), with the local slice counts summing to '
                 f'{num_slices}.  Got shapes '
                 f'{[tuple(t.shape) for t in tensors]} for prox_input.')
-        # The result goes through _shard_recon so that the placement check runs, and shards from
-        # a model on a different device layout are refused here rather than later.
+        # _shard_recon raises an error for shards from a model on different devices.
         return self._shard_recon(_sharding.Shards(
             [t.reshape(num_pixels, t.shape[-1]) for t in tensors],
             prox_input.placement))
 
     def _check_sinogram_shards(self, sinogram, sinogram_shape):
-        """Check that a sinogram already in the device form covers the model's
-        whole sinogram.
-
-        Each shard must hold a block of views together with every detector row
-        and channel, and the view counts must add up to the model's view count.
-        A shard that owns no views is allowed.  Only the shapes are checked
-        here, because :meth:`_shard_sinogram` checks the devices.
+        """This method checks that a sinogram that is already on the devices covers the whole
+        sinogram of the model.  The method checks only the shapes.
         """
         views, rows, channels = (int(sinogram_shape[0]), int(sinogram_shape[1]),
                                  int(sinogram_shape[2]))
@@ -1627,8 +1578,7 @@ class TomographyModel(ParameterHandler):
                 f'{[tuple(t.shape) for t in tensors]}.')
 
     def _flatten_hessian(self, fm_hessian):
-        """Return the Hessian diagonal in the VCD loop's flat layout.  The loop
-        only reads it, so it is not made contiguous."""
+        """This method returns the Hessian diagonal in the flat form that the VCD loop uses."""
         if isinstance(fm_hessian, _sharding.Shards):
             flat = _sharding.Shards(
                 [t.reshape((math.prod(t.shape[:-1]), t.shape[-1]))
@@ -1638,8 +1588,8 @@ class TomographyModel(ParameterHandler):
         return flat
 
     def _recon_from_flat(self, flat_recon, recon_shape):
-        """Return the three dimensional reconstruction from the VCD loop's flat
-        layout.  Each array keeps its own slice count."""
+        """This method converts a reconstruction from the flat form that the VCD loop uses to a
+        3D array."""
         if isinstance(flat_recon, _sharding.Shards):
             recon = _sharding.Shards(
                 [t.reshape(tuple(recon_shape[:2]) + (t.shape[-1],))
@@ -1653,10 +1603,9 @@ class TomographyModel(ParameterHandler):
         return shards.gather()
 
     def _as_shards(self, x, placement):
-        """Return a device form array as a Shards container.  A plain tensor is
-        wrapped in a one shard container that aliases it, so in place updates
-        reach the caller's array.  A Shards container passes through.  Nothing
-        is validated here."""
+        """This method returns an array on the devices as a Shards container.  If the array is
+        a plain tensor, the method wraps it in a container with one shard that shares its
+        memory."""
         if isinstance(x, _sharding.Shards):
             shards = x
         else:
@@ -1664,9 +1613,8 @@ class TomographyModel(ParameterHandler):
         return shards
 
     def _as_device_form(self, x):
-        """Invert :meth:`_as_shards`.  A one shard container unwraps to the
-        tensor it aliases.  A container that really spans devices is returned
-        unchanged, because collapsing it would require a gather."""
+        """This method reverses :meth:`_as_shards`.  For a container with one shard, it returns
+        the tensor in the container.  It returns a container with several shards unchanged."""
         if isinstance(x, _sharding.Shards) and x.placement.is_trivial:
             out = x.tensors[0]
         else:
@@ -1674,8 +1622,8 @@ class TomographyModel(ParameterHandler):
         return out
 
     def _sino_ones_device_form(self, sino_like=None):
-        """Return a sinogram of all ones in the device form, with one block per
-        device.  ``sino_like`` supplies only the dtype."""
+        """This method returns a sinogram of all ones on the devices.  The sinogram has the
+        dtype of ``sino_like``."""
         dtype = torch.float32 if sino_like is None else sino_like.dtype
         if self.sino_placement.is_trivial:
             return torch.ones(tuple(self.get_params('sinogram_shape')),
@@ -1690,56 +1638,82 @@ class TomographyModel(ParameterHandler):
 
     def forward_project(self, recon, output_sharded=False):
         """
-        Perform a full forward projection.  With the ``use_ror_mask``
-        parameter True (the default) the projection covers the pixels inside
-        the region-of-reconstruction mask; with it False, every pixel.
+        This method performs a full forward projection of a volume to a sinogram.  If the
+        parameter ``use_ror_mask`` is True (the default), the projection uses only the pixels
+        inside the region-of-reconstruction mask.  If ``use_ror_mask`` is False, the projection uses
+        every pixel.
 
         Args:
-            recon (numpy or tensor): 3D volume with shape
+            recon (numpy or tensor): The 3D volume, with shape
                 (num_recon_rows, num_recon_cols, num_recon_slices).
-            output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the device form: a torch
-                tensor on a single device, or a Shards container (one
-                tensor per device) on a multi-device model.
+            output_sharded (bool, optional): If False (the default), the method returns a numpy
+                array.  If True, the method returns the result on the devices.  On a model with
+                one device, the result is a torch tensor.  On a model with several devices, the
+                result is a Shards container with one tensor per device.
 
         Returns:
-            The sinogram, shape (num_views, num_det_rows, num_det_channels).
+            The sinogram, with shape (num_views, num_det_rows, num_det_channels).
+
+        Note:
+            If the user has not chosen the devices of the model, this call chooses the GPUs
+            and checks the memory that the projection needs, as ``recon_direct`` does.
         """
+        # The GPUs are chosen before the volume is copied to the devices.
+        self._apply_device_policy(workload='forward')
+        return self._forward_project(recon, output_sharded=output_sharded)
+
+    def _forward_project(self, recon, output_sharded=False):
+        """This method performs the forward projection of :meth:`forward_project` on the
+        current devices.  It does not choose GPUs or check memory.  Code inside mbirtorch calls
+        this method."""
         recon_shape = self.get_params('recon_shape')
         recon = self._shard_recon(recon)
         indices = self.full_indices_device()
         if isinstance(recon, _sharding.Shards):
-            # The row count is named rather than inferred, because reshape
-            # cannot infer it from a shard that owns no slices.
+            # reshape cannot infer the number of rows of a shard that holds no slices.
             num_pixels = int(recon_shape[0]) * int(recon_shape[1])
-            flat = _sharding.Shards(
+            voxel_values = _sharding.Shards(
                 [t.reshape(num_pixels, t.shape[-1])[indices.to(t.device)]
                  for t in recon.tensors], recon.placement)
-            sinogram = self.sparse_forward_project(flat, indices)
         else:
             voxel_values = recon.reshape(-1, recon.shape[-1])[indices]
-            sinogram = self.sparse_forward_project(voxel_values, indices)
+        # The projection reads only voxel_values, which is a copy.  When the input is a host
+        # array, this line frees the volume on the devices.
+        del recon
+        sinogram = self.sparse_forward_project(voxel_values, indices)
         return sinogram if output_sharded else self._gather_sinogram(sinogram)
 
     def back_project(self, sinogram, output_sharded=False):
         """
-        Perform a full back projection.  With the ``use_ror_mask`` parameter
-        True (the default) the result is zero outside the
-        region-of-reconstruction mask; with it False, every pixel is
-        computed.
+        This method performs a full back projection of a sinogram to a volume.  If the
+        parameter ``use_ror_mask`` is True (the default), the result is zero outside the
+        region-of-reconstruction mask.  If ``use_ror_mask`` is False, the method computes every
+        pixel.
 
         Args:
-            sinogram (numpy or tensor): 3D array with shape
+            sinogram (numpy or tensor): The 3D sinogram, with shape
                 (num_views, num_det_rows, num_det_channels).
-            output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the device form: a torch
-                tensor on a single device, or a Shards container (one
-                tensor per device) on a multi-device model.
+            output_sharded (bool, optional): If False (the default), the method returns a numpy
+                array.  If True, the method returns the result on the devices.  On a model with
+                one device, the result is a torch tensor.  On a model with several devices, the
+                result is a Shards container with one tensor per device.
 
         Returns:
-            The back projection, shape (num_recon_rows, num_recon_cols,
+            The back projection, with shape (num_recon_rows, num_recon_cols,
             num_recon_slices).
+
+        Note:
+            If the user has not chosen the devices of the model, this call chooses the GPUs
+            and checks the memory that the projection needs, as ``recon_direct`` does.
         """
+        # The GPUs are chosen before the sinogram is copied to the devices.
+        self._apply_device_policy(workload='back')
+        return self._back_project(sinogram, output_sharded=output_sharded)
+
+    def _back_project(self, sinogram, output_sharded=False):
+        """This method performs the back projection of :meth:`back_project` on the current
+        devices.  It does not choose GPUs or check memory.  Code inside mbirtorch calls this
+        method."""
         recon_shape = self.get_params('recon_shape')
         sinogram = self._shard_sinogram(sinogram)
         indices = self.full_indices_device()
@@ -1762,49 +1736,38 @@ class TomographyModel(ParameterHandler):
         return recon if output_sharded else self._gather_recon(recon)
 
     def project_points(self, points_xyz, view_index):
-        """Map object points to fractional detector indices, for one view or several.
+        """This method maps points in the object to fractional detector indices, for one view
+        or for several views.  It uses the same geometry as the projectors.
 
-        This is the geometric map the projectors implement, stated for points
-        instead of voxels.  Each geometry class computes it from the same
-        functions its projection bodies use, so the answer here is the answer
-        the projector gives, up to the projector's float32 rounding and its
-        footprint weights.
-
-        The object frame is the right-handed (x, y, z) frame in which voxel
-        (i, j, k) of the reconstruction has its center at
+        The points are given in the object frame.  In this frame, voxel (i, j, k) of the
+        reconstruction has its center at
 
             x = delta_voxel * (j - (num_cols - 1) / 2)
             y = voxel_row_aspect * delta_voxel * (i - (num_rows - 1) / 2)
             z = voxel_slice_aspect * delta_voxel * (k - (num_slices - 1) / 2) + recon_slice_offset
 
-        so the column index runs along x, the row index along y, and the slice
-        index along z, the rotation axis.  ``recon_slice_offset`` is zero for a
-        geometry that has no such parameter.  Points are given in this frame,
-        before the view's own action on the object: a view rotates the object
-        about z by its angle (parallel, cone, and multiaxis), shifts it by its
-        helical z shift (cone), or translates it by minus its translation
-        vector (translation).  This method applies that action itself.
+        The z axis is the rotation axis.  For each view, the method applies the motion of the
+        object in that view.  This motion is a rotation about z, a helical shift in z, or a
+        translation.
 
-        The result is a pair of fractional indices into a sinogram of shape
-        ``(num_views, num_det_rows, num_det_channels)``.  Integer index m is
-        the center of detector row m, and index -0.5 is the outer edge of row
-        0.  A point outside the detector gets an index outside
-        ``[-0.5, num - 0.5]``; nothing is clipped.
+        The integer index m is the center of detector row m, and the index -0.5 is the outer
+        edge of row 0.  A point outside the detector gets an index outside
+        ``[-0.5, num - 0.5]``.  The method does not clip the indices.
 
         Args:
-            points_xyz (array_like): the points, (N, 3) as (x, y, z) in ALU,
-                or one point as (3,).
-            view_index (int or sequence of int): one view, or several.
+            points_xyz (array_like): The points in ALU, as an (N, 3) array of (x, y, z), or one
+                point as a (3,) array.
+            view_index (int or sequence of int): One view index, or several view indices.
 
         Returns:
-            tuple of ndarray: ``(row, channel)`` as float64 arrays.  For one
-            view each has shape (N,); for a sequence of views each has shape
+            tuple of ndarray: The pair ``(row, channel)`` as float64 arrays.  For one view, each
+            array has shape (N,).  For a sequence of views, each array has shape
             (num_selected_views, N).
 
         Raises:
-            ValueError: if ``points_xyz`` is not (N, 3) or (3,), or if a view
-                index is not an integer.
-            IndexError: if a view index is outside ``[0, num_views)``.
+            ValueError: If ``points_xyz`` does not have shape (N, 3) or (3,), or if a view index
+                is not an integer.
+            IndexError: If a view index is outside ``[0, num_views)``.
 
         Example:
             >>> row, channel = model.project_points([[0.0, 0.0, 0.0]], 0)
@@ -1825,8 +1788,7 @@ class TomographyModel(ParameterHandler):
             raise IndexError(f'view_index {view_index!r} is outside '
                              f'[0, {num_views}).')
         view_params = np.asarray(self.get_params(self.get_params('view_params_name')))[indices]
-        # The computation runs in float64 on the host, because a device
-        # transfer would cost more than this small amount of arithmetic.
+        # The computation runs in float64 on the CPU.
         row, channel = self._project_points_batch(
             torch.as_tensor(points, dtype=torch.float64),
             torch.as_tensor(view_params, dtype=torch.float64))
@@ -1837,16 +1799,17 @@ class TomographyModel(ParameterHandler):
         return row, channel
 
     def _project_points_batch(self, points, view_params):
-        """The geometry's own part of :meth:`project_points`.
+        """This method computes the part of :meth:`project_points` that depends on the
+        geometry.
 
         Args:
-            points: (N, 3) float64 CPU tensor of object-frame points.
-            view_params: the selected rows of the model's per-view parameter
-                array, as a float64 CPU tensor: (V,) angles for parallel beam,
-                (V, 2) for cone and multiaxis, (V, 3) for translation.
+            points: A float64 CPU tensor with shape (N, 3) that holds points in the object frame.
+            view_params: A float64 CPU tensor that holds the selected rows of the per-view
+                parameter array.  Its shape is (V,) for parallel beam, (V, 2) for cone beam and
+                multiaxis, and (V, 3) for translation.
 
         Returns:
-            (row, channel): float64 CPU tensors, each (V, N).
+            (row, channel): Two float64 CPU tensors, each with shape (V, N).
         """
         raise NotImplementedError(
             f'{type(self).__name__} does not implement project_points.')
@@ -1854,35 +1817,26 @@ class TomographyModel(ParameterHandler):
     def compute_hessian_diagonal(self, weights=None, output_sharded=False,
                                  indices=None):
         """
-        Compute the diagonal of the Hessian matrix: a back projection of the
-        weights using squared coefficients.
+        This method computes the diagonal of the Hessian matrix.  The diagonal is the back
+        projection of the weights with squared projector coefficients.
 
         Args:
-            weights (numpy or tensor, optional): 3D positive weights with the
-                same shape as the sinogram.  Defaults to all 1s.
-            output_sharded (bool, optional): If False (default), return numpy;
-                if True, return the device tensor.
-            indices (tensor, optional): back-project at these flat pixel
-                indices only, leaving entries outside the set ZERO.  None
-                (the default) covers all pixels of the grid.
+            weights (numpy or tensor, optional): The 3D positive weights, with the same shape as
+                the sinogram.  Defaults to all ones.
+            output_sharded (bool, optional): If False (the default), the method returns a numpy
+                array.  If True, the method returns the result on the devices.
+            indices (tensor, optional): The flat pixel indices at which to back project.  The
+                entries outside this set are zero.  If None (the default), the method uses all
+                pixels of the grid.
 
         Returns:
-            Diagonal of the Hessian matrix with the same shape as the recon.
+            The diagonal of the Hessian matrix, with the same shape as the recon.
 
         Note:
-            On a model whose device layout is still automatic, this call also
-            decides the layout, and every later reconstruction on the model
-            reuses it.  The layout is sized for a full reconstruction whenever
-            one fits.  On a problem too large for any full reconstruction, the
-            memory check falls back to what this call itself allocates, which
-            is much smaller, the way the direct reconstructions do; the
-            Hessian diagonal can then be computed where a full reconstruction
-            could not run.  A later :meth:`recon` on such a layout runs the
-            memory check again and raises ``MemoryPreflightError``, rather
-            than reusing a layout that was never checked for it.
+            If the user has not chosen the devices of the model, this call also chooses the
+            GPUs.  Every later reconstruction on the model reuses these GPUs.
         """
-        # The layout is settled before the full array of weights and the full volume are built.
-        # Otherwise they would land whole on the lead device.
+        # The GPUs must be chosen before the full weights and volume are built.
         self._apply_device_policy(workload='direct')
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
         if weights is None:
@@ -1904,9 +1858,8 @@ class TomographyModel(ParameterHandler):
                                       device=self.torch_device)
         hessian = self.sparse_back_project(weights, indices, coeff_power=2)
 
-        # A dense back projection is already the flat volume, so it is reshaped.  A masked one
-        # returns only its own rows, so it is scattered into a volume of zeros.  An explicit
-        # index set is always scattered, because a reordered set is not the identity permutation.
+        # A back projection at all pixels is reshaped.  A back projection at selected pixels is
+        # copied into a volume of zeros.
         def to_volume(cylinders, device):
             if dense:
                 return cylinders.reshape((recon_shape[0], recon_shape[1],
@@ -1927,19 +1880,13 @@ class TomographyModel(ParameterHandler):
         return hessian if output_sharded else self._gather_recon(hessian)
 
     def get_voxels_at_indices(self, recon, indices):
-        """The voxel cylinders at ``indices``, as (num_indices, num_slices).
-
-        A recon divided across devices keeps its division: each shard is
-        flattened and indexed on the device that holds it, and the result is a
-        container over the same placement.  Only the row and column axes are
-        flattened and only rows are selected, so the slice axis -- the one the
-        shards are cut on -- is untouched, and gathering the result gives
-        exactly what the whole-array call gives.
+        """This method returns the voxel cylinders at ``indices`` as an array with shape
+        (num_indices, num_slices).  If the recon is split across devices, the result is split
+        in the same way.
         """
         if isinstance(recon, _sharding.Shards):
             recon_shape = self.get_params('recon_shape')
-            # The row count is named rather than inferred, because reshape
-            # cannot infer it from a shard that owns no slices.
+            # reshape cannot infer the number of rows of a shard that holds no slices.
             num_pixels = int(recon_shape[0]) * int(recon_shape[1])
             indices = torch.as_tensor(indices, dtype=torch.int64)
             return _sharding.Shards(
@@ -1950,21 +1897,15 @@ class TomographyModel(ParameterHandler):
     # ── auto-regularization ───────────────────────────────────────────────────
     def auto_set_regularization_params(self, sinogram, weights=None):
         """
-        Automatically set the regularization parameters (sigma_y, sigma_x,
-        and sigma_prox) from the sinogram and optional weights, and return
-        them as a dict.  The parameters change only when
-        ``auto_regularize_flag`` is True.  The statistics run on the host,
-        on a view subsample.
+        This method sets the regularization parameters sigma_y, sigma_x, and sigma_prox from
+        the sinogram and the optional weights.  It returns the parameters as a dict.  The method
+        changes the parameters only if ``auto_regularize_flag`` is True.
         """
-        # The statistics run on the host, so a tensor on any device is copied
-        # there first.
         if torch.is_tensor(sinogram):
             sinogram = sinogram.cpu().numpy()
         if torch.is_tensor(weights):
             weights = weights.cpu().numpy()
         if self.get_params('auto_regularize_flag'):
-            # The statistics are estimated from a subsample of the views, which
-            # costs the same at any sinogram size.
             small_sinogram = self.subsample_views(sinogram)
             small_weights = 1 if weights is None else self.subsample_views(weights)
 
@@ -1981,11 +1922,11 @@ class TomographyModel(ParameterHandler):
         return dict(zip(_AUTO_REGULARIZATION_PARAM_NAMES, values))
 
     def _check_lateral_truncation(self, sino_indicator):
-        """Warn if the sinogram support (the indicator from
-        :meth:`_get_sino_indicator`) reaches the detector's edge channels."""
+        """This method warns if the sinogram support reaches the edge channels of the
+        detector.  The support is the indicator from :meth:`_get_sino_indicator`."""
         if np.all(sino_indicator):
-            # An indicator of all ones means either that the background could not be determined,
-            # which has already warned, or that the support really covers everything.
+            # An indicator of all ones means either that the background was not found or that
+            # the support is the whole sinogram.
             return
         edge_frac = float(np.mean(np.logical_or(sino_indicator[:, :, 0],
                                                 sino_indicator[:, :, -1])))
@@ -1996,13 +1937,10 @@ class TomographyModel(ParameterHandler):
                 f"resize_recon_fov(s, s) where s >= 1.1 to improve image quality.")
 
     def auto_set_sigma_y(self, sinogram, sino_indicator, weights=1):
-        """Set sigma_y from the (typically view-subsampled) sinogram, its
-        support indicator, and optional weights.
-
-        The statistics run on the host, against a host support indicator of the
-        same shape, so a divided sinogram is refused.  To reduce a divided
-        sinogram to something this accepts, take a view subsample of it with
-        :meth:`subsample_views`, which returns a host array.
+        """This method sets sigma_y from the sinogram, its support indicator, and the optional
+        weights.  The sinogram is typically subsampled in views.  The method does not accept a
+        sharded sinogram.  The method :meth:`subsample_views` converts a sharded sinogram to a
+        host array.
         """
         _sharding.reject_shards('auto_set_sigma_y', sinogram=sinogram,
                                 sino_indicator=sino_indicator, weights=weights)
@@ -2010,14 +1948,12 @@ class TomographyModel(ParameterHandler):
         magnification = self.get_magnification()
         delta_voxel, delta_det_channel = self.get_params(['delta_voxel', 'delta_det_channel'])
 
-        # This is the root mean square of the sinogram over its support.
         signal_rms = float(np.average(weights * np.asarray(sinogram) ** 2, None,
                                       sino_indicator) ** 0.5)
 
         rel_noise_std = 10 ** (-snr_db / 20)
 
-        # The regularization is adjusted when the reconstruction resolution differs from the
-        # default.  The default pixel pitch is the detector pitch scaled by the magnification.
+        # The default pixel pitch is the detector pitch divided by the magnification.
         default_pixel_pitch = delta_det_channel / magnification
         pixel_pitch_relative_to_default = delta_voxel / default_pixel_pitch
 
@@ -2026,52 +1962,34 @@ class TomographyModel(ParameterHandler):
         self.set_params(no_warning=True, sigma_y=float(sigma_y), auto_regularize_flag=True)
 
     def auto_set_sigma_x(self, recon_std):
-        """Set sigma_x (the qGGMRF prior scale) from the estimated recon
-        standard deviation."""
+        """This method sets sigma_x, the scale of the qGGMRF prior, from the estimated
+        standard deviation of the recon."""
         sharpness = self.get_params('sharpness')
-        # This is a fraction of the typical reconstruction value.  The constant
-        # 0.2 was determined empirically.
+        # The constant 0.2 is empirical.
         sigma_x = np.float32(0.2 * (2 ** sharpness) * recon_std)
         self.set_params(no_warning=True, sigma_x=float(sigma_x), auto_regularize_flag=True)
 
     def auto_set_sigma_prox(self, recon_std):
-        """Set sigma_prox (the proximal map prior scale) from the estimated
-        recon standard deviation."""
+        """This method sets sigma_prox, the scale of the proximal map prior, from the estimated
+        standard deviation of the recon."""
         sharpness = self.get_params('sharpness')
-        # This is a fraction of the typical reconstruction value.  The constant
-        # 0.2 was determined empirically.
+        # The constant 0.2 is empirical.
         sigma_prox = np.float32(0.2 * (2 ** sharpness) * recon_std)
         self.set_params(no_warning=True, sigma_prox=float(sigma_prox),
                         auto_regularize_flag=True)
 
     @staticmethod
     def subsample_views(array, max_views_to_use=20):
-        """Return an evenly-spaced subsample of about ``max_views_to_use``
-        views (axis 0) as a host numpy array.  The statistical sinogram
-        estimates run on such a subsample.  The stride depends only on the
-        view count, so a second call with the same arguments subsamples a
-        companion array (e.g. weights) the same way.
-
-        A sinogram already divided across devices (a ``Shards``) is subsampled
-        without assembling it: each shard's strided block is taken on the
-        device that holds it, and only those views cross to the host.
-
-        For sharded input the result is EXACT -- the same views in the same
-        order as striding the assembled sinogram -- because this is data
-        movement rather than an approximation.  Shard k owns global views
-        ``[start_k, end_k)``, so the sampled global positions
-        ``0, step, 2 * step, ...`` that land in that block are the local
-        positions ``j`` with ``(start_k + j) % step == 0`` -- they begin at
-        local offset ``(-start_k) % step`` and continue by ``step``.  Taking
-        each shard's block from that offset and concatenating on the view axis
-        reproduces the strided sinogram view for view.  A shard that owns no
-        views, or one in which no sampled position lands, contributes an empty
-        block, which changes nothing.
+        """This method returns about ``max_views_to_use`` evenly spaced views (axis 0) as a
+        numpy array in host memory.  The stride depends only on the number of views.  As a
+        result, a second call with the same arguments subsamples a matching array, such as the
+        weights, in the same way.  For a sharded sinogram, the method subsamples each shard on
+        its device.  The result is the same as for the full sinogram.
         """
         if isinstance(array, _sharding.Shards):
             placement = array.placement
-            # The sharded axis may be written as a negative number, so resolve
-            # it against the rank before comparing it with the view axis.
+            # The sharded axis may be negative, so the code converts it with the number of
+            # dimensions.
             if placement.axis % array.tensors[0].ndim != 0:
                 raise ValueError(
                     'A sinogram must be sharded on its first (view) axis; got '
@@ -2088,8 +2006,6 @@ class TomographyModel(ParameterHandler):
             for tensor, (_dev, (start, _end)) in zip(
                     array.tensors, placement.shard_ranges(num_views)):
                 block = tensor[(-start) % step_size::step_size]
-                # The block is made contiguous on the shard's own device, so
-                # that the copy to the host carries only the sampled views.
                 blocks.append(block.detach().contiguous().cpu().numpy())
             return np.concatenate(blocks, axis=0)
         num_views = array.shape[0]
@@ -2099,19 +2015,15 @@ class TomographyModel(ParameterHandler):
 
     @staticmethod
     def _get_sino_indicator(sinogram, verbose=1):
-        """Return an int8 mask of the sinogram support, with the same shape as
-        the input.  This runs several reductions on the host, so it is usually
-        called on a subsample of the views."""
-        # Taking the negative logarithm of a sinogram can produce complex
-        # values, so the input is checked for complex values and for NaN.
+        """This method returns an int8 mask of the sinogram support.  The mask has the same
+        shape as the input.  The support is the set of entries that the object attenuates."""
+        # The negative logarithm of a sinogram can give complex values, so the input is checked.
         sinogram = np.asarray(sinogram)
         if np.iscomplexobj(sinogram):
             raise TypeError("sinogram must be real-valued; got complex dtype.")
         if not np.isfinite(sinogram).all():
             raise ValueError("sinogram contains NaN and/or Inf values.")
 
-        # The initial threshold is the right boundary of the background cluster
-        # plus one cluster width.
         left, right = vcd_utils.estimate_background_cluster_boundaries(sinogram)
         threshold = right + (right - left)
 
@@ -2127,58 +2039,46 @@ class TomographyModel(ParameterHandler):
                               'regularization.\n')
             return np.ones_like(sinogram, dtype=np.int8)
 
-        # The final threshold is a fraction of the median over the object
-        # region.
         object_level = 0.25
         object_median = np.median(sinogram[sinogram >= threshold])
         object_threshold = object_level * object_median
         return np.int8(sinogram >= object_threshold)
 
     def _get_estimate_of_recon_std(self, sinogram, sino_indicator):
-        """Estimate the standard deviation of the reconstruction from the
-        sinogram and its support indicator.  The result scales sigma_x and
-        sigma_prox."""
+        """This method estimates the standard deviation of the reconstruction from the
+        sinogram and its support indicator."""
         delta_det_channel = self.get_params('delta_det_channel')
         delta_voxel = self.get_params('delta_voxel')
         recon_shape = self.get_params('recon_shape')
         magnification = self.get_magnification()
         num_det_channels = sinogram.shape[-1]
 
-        # This is the typical magnitude of a sinogram value.
         typical_sinogram_value = np.average(np.abs(sinogram), weights=sino_indicator)
 
-        # This path length estimate comes from the reconstruction width and
-        # height.
         typical_path_length_space = (2 * recon_shape[0] * recon_shape[1]) / (
                 recon_shape[0] + recon_shape[1]) * delta_voxel
 
-        # This path length estimate comes from the detector width.
         typical_path_length_sino = num_det_channels * delta_det_channel / magnification
 
         typical_path_length = np.minimum(typical_path_length_space, typical_path_length_sino)
 
-        # The typical reconstruction value is the typical sinogram value
-        # divided by the typical path length.
         return typical_sinogram_value / typical_path_length
 
     # ── direct recon (FBP) machinery ──────────────────────────────────────────
     def _apply_direct_recon_filter(self, sinogram, filter_name, filter_scale,
                                    output_sharded=False, row_weight=None):
-        """Apply the filtered backprojection row filter for a direct
-        reconstruction.
-
-        The scale factor ``filter_scale * pi / num_views`` is folded into the
-        small filter array rather than multiplied into the whole sinogram.  The
-        factor pi divided by num_views assumes views equally spaced over the
-        full angular range.
+        """This method applies the row filter of filtered back projection for a direct
+        reconstruction.  The filter is scaled by ``filter_scale * pi / num_views``.
 
         Args:
-            sinogram: (num_views, num_rows, num_channels); numpy or tensor.
-            filter_name (str): filter for generate_direct_recon_filter.
-            filter_scale (float): geometry-specific filter scaling.
-            output_sharded (bool): True returns the device tensor.
-            row_weight (tensor or None): optional (rows, channels)
-                per-detector pre-weight (the FDK cosine map); None is pure FBP.
+            sinogram: The sinogram, as a numpy array or tensor with shape
+                (num_views, num_rows, num_channels).
+            filter_name (str): The name of the filter for ``generate_direct_recon_filter``.
+            filter_scale (float): The filter scale factor of the geometry.
+            output_sharded (bool): If True, the method returns the result on the devices.
+            row_weight (tensor or None): An optional (rows, channels) weight that multiplies
+                each detector pixel before the filter.  For FDK, this is the cosine weight.  If
+                None, the method applies plain FBP filtering.
 
         Returns:
             The filtered sinogram.
@@ -2189,8 +2089,6 @@ class TomographyModel(ParameterHandler):
             num_channels, filter_name=filter_name)
         recon_filter = recon_filter * np.float32(filter_scale * (np.pi / num_views))
         if isinstance(sinogram, _sharding.Shards):
-            # The filter acts on each detector row on its own, so each shard
-            # filters its own views with no data from other devices.
             def filter_worker(i, d):
                 ft = torch.as_tensor(recon_filter, device=d)
                 rw = None if row_weight is None else row_weight.to(d)
@@ -2209,38 +2107,33 @@ class TomographyModel(ParameterHandler):
     @staticmethod
     def get_forward_model_loss(error_sinogram, sigma_y, weights=None, normalize=True):
         """
-        Calculate the forward model loss from the error sinogram and weights,
-        where error_sinogram = measured_sinogram - forward_proj(recon).
+        This method computes the forward model loss from the error sinogram and the weights.
+        The error sinogram is error_sinogram = measured_sinogram - forward_proj(recon).
 
         Args:
-            error_sinogram (tensor): 3D error sinogram.
-            sigma_y (float): the sinogram noise standard deviation parameter.
-            weights (tensor, optional): sinogram weights.  Defaults to all 1s.
-            normalize (bool, optional): If True (default), return the
-                weight-normalized RMSE form; otherwise the unnormalized
-                weighted squared error.
+            error_sinogram (tensor): The 3D error sinogram.
+            sigma_y (float): The standard deviation of the sinogram noise.
+            weights (tensor, optional): The sinogram weights.  Defaults to all ones.
+            normalize (bool, optional): If True (the default), the method returns the RMSE
+                normalized by the weights.  Otherwise, it returns the weighted squared error
+                without normalization.
 
         Returns:
-            The loss as a device scalar tensor.
+            The loss as a scalar tensor on the device.
         """
-        # The sums below run on one array on one device, so a sharded array is
-        # refused here.
+        # The method does not accept a sharded array, because the sums run on one device.
         _sharding.reject_shards('get_forward_model_loss',
                                 error_sinogram=error_sinogram, weights=weights)
         if weights is None:
             weights = 1
             avg_weight = 1
         elif np.ndim(weights) == 0:
-            # For a scalar the average weight is the scalar itself.
             avg_weight = weights
         else:
-            # This branch takes any array, including a numpy array, which is
-            # not a torch tensor.
             weights = torch.as_tensor(weights, dtype=torch.float32,
                                       device=error_sinogram.device)
             avg_weight = torch.mean(weights)
-        # The sum runs in chunks, so no array of sinogram size is allocated.
-        weighted_sq_sum = _memory_ledger.weighted_square_sum(error_sinogram,
+        weighted_sq_sum = _memory_estimate.weighted_square_sum(error_sinogram,
                                                              weights)
         if normalize:
             loss = torch.sqrt(weighted_sq_sum
@@ -2251,30 +2144,25 @@ class TomographyModel(ParameterHandler):
 
     @staticmethod
     def _vcd_iteration_stats(error_sinogram, flat_recon, sigma_y, weights=None):
-        """Return the per-iteration VCD statistics (fm_loss, recon_l1,
-        es_rmse).  Both statistics are normalized by the number of elements in
-        the error sinogram."""
+        """This method returns the VCD statistics of one iteration as the tuple
+        (fm_loss, recon_l1, es_rmse)."""
         fm_loss = TomographyModel.get_forward_model_loss(
             error_sinogram, sigma_y, weights)
-        # The sums below run in chunks, so no second array of reconstruction or sinogram size is
-        # allocated.  The chunked order can change the last digits of the NMAE stopping test.
-        recon_l1 = _memory_ledger.image_ell1(flat_recon)
-        es_rmse = torch.sqrt(_memory_ledger.weighted_square_sum(error_sinogram)
+        # ``image_l1_norm`` sums in chunks, which can change the last digits of the NMAE stopping
+        # test.
+        recon_l1 = _memory_estimate.image_l1_norm(flat_recon)
+        es_rmse = torch.sqrt(_memory_estimate.weighted_square_sum(error_sinogram)
                              / float(error_sinogram.numel()))
         return fm_loss, recon_l1, es_rmse
 
     def get_forward_lin_quad(self, weighted_error_sinogram, delta_sinogram, weights,
                              fm_constant, const_weights):
         """
-        Compute the two forward model line-search terms:
-        ``fm_constant * sum(weighted_error_sinogram * delta_sinogram)`` and
-        ``fm_constant * sum(delta_sinogram^2 * weights)``, returned as device
-        scalars.
-
-        The reconstruction loop calls this once per shard, on that shard's own
-        tensors, and combines the partials itself.  A whole divided array is
-        refused: summing one would take a cross-device reduction and a choice
-        of where the scalars land.
+        This method computes the two forward model terms of the line search.  The first term
+        is ``fm_constant * sum(weighted_error_sinogram * delta_sinogram)``.  The second term is
+        ``fm_constant * sum(delta_sinogram^2 * weights)``.  The method returns both terms as
+        scalar tensors on the device.  The inputs must be plain tensors, and the method does not
+        accept a sharded array.
         """
         _sharding.reject_shards('get_forward_lin_quad',
                                 weighted_error_sinogram=weighted_error_sinogram,
@@ -2289,37 +2177,39 @@ class TomographyModel(ParameterHandler):
 
     # ── the VCD loop ────────────────────────────────────────────────────────
     def _get_update_direction(self, forward_grad, prior_grad, forward_hess,
-                              prior_hess, pixel_indices, dev_index=0):
-        """Return the update direction for one subset of pixels.
+                              prior_hess, pixel_indices, dev_index=0, slice_sums=None):
+        """This method returns the update direction for one subset of pixels.  The direction
+        is the preconditioned gradient -(forward_grad + prior_grad) / (forward_hess + prior_hess).
 
-        The base implementation is the preconditioned gradient
-        -(forward_grad + prior_grad) / (forward_hess + prior_hess).
-        An override must return -M (forward_grad + prior_grad) with M positive
-        definite, which preserves the minimizers of the cost.  The arguments
-        are one shard's arrays, of shape (num_subset_pixels, local_slices).
-        The base implementation ignores ``dev_index``."""
+        The method returns the pair (direction, slice_pair_sum).  ``slice_pair_sum`` is the slice
+        term of the exact line search, computed from ``slice_sums`` with
+        :func:`qggmrf.qggmrf_slice_pair_sum`.  It is None when ``slice_sums`` is None."""
         fn = maybe_compile(_diagonal_update_direction, self.compile_enabled)
-        return fn(forward_grad, prior_grad, forward_hess, prior_hess)
+        direction = fn(forward_grad, prior_grad, forward_hess, prior_hess)
+        if slice_sums is None:
+            return direction, None
+        return direction, _qggmrf.qggmrf_slice_pair_sum(slice_sums)
 
     def create_vcd_subset_updater(self, fm_hessian, weights, prox_input=None):
         """
-        Create the function that updates one subset of pixels in the recon
-        and error sinogram.  The updater is one body over the loop's uniform
-        per-device state: each step runs per shard, and the line-search
-        partials combine on device, so the subset loop has no host
-        synchronization at any device count.
+        This method creates the function that updates one subset of pixels in the recon and
+        in the error sinogram.
 
         Args:
-            fm_hessian (tensor or Shards): (num_pixels, num_slices) Hessian
-                diagonal for the forward model loss.
-            weights (tensor, Shards, or 1): sinogram weights, or the
-                constant 1.
-            prox_input (tensor or Shards, optional): proximal-map input,
-                flattened to (num_pixels, num_slices).
+            fm_hessian (tensor or Shards): The Hessian diagonal of the forward model loss, with
+                shape (num_pixels, num_slices).
+            weights (tensor, Shards, or 1): The sinogram weights, or the constant 1.
+            prox_input (tensor or Shards, optional): The input of the proximal map, flattened to
+                shape (num_pixels, num_slices).
 
         Returns:
-            (callable) vcd_subset_updater(flat_recon, error_sinogram,
-            pixel_indices), which updates the state in place.
+            (callable) The function vcd_subset_updater(flat_recon, error_sinogram,
+            pixel_indices, subset_index), which updates the recon and the error sinogram in
+            place.  ``subset_index`` selects the pair lists of the subset.  Before the subsets
+            of a partition are updated, the function attribute ``stage_halos`` must be called.
+            With the qGGMRF prior, the function attribute ``stage_pair_lists`` must also be
+            called with the pair lists of the partition from
+            :func:`vcd_utils.gen_neighbor_pair_lists`.
         """
         sino_placement, recon_placement = self.sino_placement, self.recon_placement
         devices = sino_placement.devices
@@ -2343,12 +2233,14 @@ class TomographyModel(ParameterHandler):
         recon_shape = self.get_params('recon_shape')
         max_alpha = self.get_params('max_alpha')
 
-        # The compiled functions are bound once for all subsets, with one instance per device
-        # thread.  A compiled function carries launcher state that must not be shared.
+        # Each device thread gets its own compiled function, because a compiled function holds
+        # state that the threads must not share.
         def per_dev(fn):
             return [maybe_compile(fn, self.compile_enabled, instance_key=i)
                     for i in range(num_devices)]
-        qggmrf_grad_hess = per_dev(_qggmrf.qggmrf_gradient_and_hessian_at_indices)
+        prior_pass = per_dev(_qggmrf.qggmrf_prior_pass_at_indices)
+        edge_term = per_dev(_qggmrf.qggmrf_edge_term)
+        pair_sum = per_dev(_qggmrf.qggmrf_pair_sum)
         prior_line_terms = per_dev(_prior_line_terms)
         lin_quad_const = per_dev(_forward_lin_quad_const)
         lin_quad_weighted = per_dev(_forward_lin_quad_weighted)
@@ -2357,57 +2249,39 @@ class TomographyModel(ParameterHandler):
         dev0 = devices[0]
 
         def combine_on_lead(parts):
-            """Sum the zero dimensional partial results of each shard on the
-            lead device."""
+            """This function sums the scalar results of each shard on the first device."""
             total = parts[0]
             for part in parts[1:]:
                 total = total + _sharding.move_shard(part, dev0,
                                                      self.dev2dev_safe)
             return total
 
-        # The qGGMRF boundary halos are staged once for each pass over a partition.  A halo of
-        # None means a reflected boundary at a true edge of the volume.
+        # A halo holds the boundary slices of the neighboring device.  A halo of None means a
+        # reflected boundary at a true edge of the volume.
         halos = {'left': [None] * num_devices, 'right': [None] * num_devices}
 
         def stage_halos(flat_shards):
             halos['left'], halos['right'] = _sharding.exchange_qggmrf_halos(
                 flat_shards, self.dev2dev_safe)
 
-        def vcd_subset_updater(flat_recon, error_sinogram, pixel_indices):
-            """Run one VCD update on a single subset of the partition.  The
-            invariant is error_sinogram = measured_sinogram -
-            forward_proj(recon).  The arguments flat_recon and error_sinogram
-            are shards and are updated in place.
+        # The pair lists of the current partition hold, for each direction in the slice, the
+        # pairs array on each device, the pair counts, and the neighbor weight of the pairs.
+        pair_lists = []
 
-            Returns:
-                flat_recon, error_sinogram, ell1_for_subset,
-                alpha_for_subset, delta_sumsq_subset.
-            """
+        def stage_pair_lists(lists):
+            pair_lists[:] = [([torch.as_tensor(pairs).to(dev) for dev in devices], counts,
+                              b_pair)
+                             for (pairs, counts), b_pair in zip(lists, (b[0] + b[1],
+                                                                        b[2] + b[3]))]
+
+        def vcd_subset_updater(flat_recon, error_sinogram, pixel_indices, subset_index=0):
+            """This function runs one VCD update on one subset of the partition, in place.  It
+            returns flat_recon, error_sinogram, ``l1_for_subset`` (the L1 norm of the update),
+            alpha_for_subset, and delta_sumsq_subset."""
             pixel_indices_per_device = [torch.as_tensor(pixel_indices, dtype=torch.int64).to(dev)
                        for dev in devices]
 
-            # This computes the prior gradient and Hessian at each pixel of the index set, one
-            # shard at a time.  The halos carry the term that crosses a shard boundary.
-            def prior_worker(i, dev):
-                if prox_input is None:
-                    grad, hess = qggmrf_grad_hess[i](
-                        flat_recon.tensors[i], recon_shape, pixel_indices_per_device[i],
-                        qggmrf_params, left_halo=halos['left'][i],
-                        right_halo=halos['right'][i])
-                else:
-                    # The proximal map prior acts pointwise, so its Hessian is
-                    # a scalar.
-                    grad = _qggmrf.prox_gradient_at_indices(
-                        flat_recon.tensors[i], prox_input.tensors[i],
-                        pixel_indices_per_device[i], sigma_prox)
-                    hess = 1 / (sigma_prox ** 2)
-                return grad, hess
-
-            prior_terms = _sharding.run_per_device(devices, prior_worker,
-                                             executor=self._per_device_pool)
-
-            # The forward model loss is
-            # 1/(2 sigma_y^2) || error_sinogram - A delta ||_weights^2.
+            # The forward model loss is 1/(2 sigma_y^2) || error_sinogram - A delta ||_weights^2.
             if const_weights:
                 weighted_error_sinogram = error_sinogram
             else:
@@ -2417,43 +2291,93 @@ class TomographyModel(ParameterHandler):
                         * error_sinogram.tensors[i],
                         executor=self._per_device_pool), sino_placement)
 
-            # The back projection gives the gradient.  The value fm_constant is
-            # 1/sigma_y^2.
+            # The back projection gives the gradient, and fm_constant is 1/sigma_y^2.
             back_projected_error = self.sparse_back_project(weighted_error_sinogram, pixel_indices)
             if not const_weights:
-                # The weighted product is no longer needed, because the line
-                # search terms fuse the weights into their own reductions.
                 weighted_error_sinogram = None
 
-            # Each shard computes its update direction and its prior line
-            # search terms in one worker.
-            def direction_worker(i, dev):
-                prior_grad, prior_hess = prior_terms[i]
-                forward_grad = -fm_constant * back_projected_error.tensors[i]
+            # The halos supply the prior terms that cross a boundary between devices.  The
+            # forward model gradient is computed in place in the output of the back projection.
+            def prior_worker(i, dev):
+                forward_grad = back_projected_error.tensors[i].mul_(-fm_constant)
                 forward_hess = fm_constant * fm_hessian.tensors[i][pixel_indices_per_device[i]]
-                delta_recon = self._get_update_direction(
-                    forward_grad, prior_grad, forward_hess, prior_hess,
-                    pixel_indices_per_device[i], dev_index=i)
+                if prox_input is None:
+                    grad, hess, slice_sums = _qggmrf.qggmrf_prior_pass_in_chunks(
+                        flat_recon.tensors[i], recon_shape, pixel_indices_per_device[i],
+                        qggmrf_params, forward_grad, forward_hess,
+                        left_halo=halos['left'][i], right_halo=halos['right'][i],
+                        chunk_function=prior_pass[i])
+                else:
+                    grad = _qggmrf.prox_gradient_at_indices(
+                        flat_recon.tensors[i], prox_input.tensors[i],
+                        pixel_indices_per_device[i], sigma_prox)
+                    hess = 1 / (sigma_prox ** 2)
+                    slice_sums = None
+                return forward_grad, forward_hess, grad, hess, slice_sums
+
+            prior_terms = _sharding.run_per_device(devices, prior_worker,
+                                             executor=self._per_device_pool)
+            del back_projected_error
+
+            # The exact quadratic term of the qGGMRF prior is computed from the approximate
+            # term sum(prior_hess * delta^2).  The code subtracts the edge term and the pair
+            # terms of the slice pairs and of the pairs in each slice.
+            def direction_worker(i, dev):
+                forward_grad, forward_hess, prior_grad, prior_hess, slice_sums = prior_terms[i]
+                indices = pixel_indices_per_device[i]
+                delta_recon, slice_pair_sum = self._get_update_direction(
+                    forward_grad, prior_grad, forward_hess, prior_hess, indices,
+                    dev_index=i, slice_sums=slice_sums)
                 prior_hess_t = (prior_hess if torch.is_tensor(prior_hess)
                                 else torch.as_tensor(prior_hess,
                                                      dtype=torch.float32,
                                                      device=delta_recon.device))
                 prior_linear_part, prior_quadratic_part = prior_line_terms[i](
                     prior_grad, prior_hess_t, delta_recon)
+                if prox_input is None:
+                    prior_quadratic_part = (
+                        prior_quadratic_part
+                        - edge_term[i](delta_recon, indices, recon_shape, qggmrf_params,
+                                       halos['left'][i] is None, halos['right'][i] is None)
+                        - slice_pair_sum)
+                    for pairs, counts, b_pair in pair_lists:
+                        prior_quadratic_part = prior_quadratic_part - \
+                            _qggmrf.qggmrf_pair_sum_in_chunks(
+                                flat_recon.tensors[i], indices, delta_recon,
+                                pairs[i][subset_index], int(counts[subset_index]), b_pair,
+                                qggmrf_params, chunk_function=pair_sum[i])
                 return delta_recon, prior_linear_part, prior_quadratic_part
             direction_results = _sharding.run_per_device(devices, direction_worker,
                                             executor=self._per_device_pool)
-            delta_recon_per_device = [delta for delta, _, _ in direction_results]
-            prior_linear = combine_on_lead(
-                [linear for _, linear, _ in direction_results])
-            prior_quadratic_approx = combine_on_lead(
-                [quadratic for _, _, quadratic in direction_results])
+            delta_recon_per_device = [result[0] for result in direction_results]
+            prior_linear = combine_on_lead([result[1] for result in direction_results])
+            prior_quadratic = combine_on_lead([result[2] for result in direction_results])
 
-            # These buffers are freed before the delta projection, which uses
-            # much more memory.
-            del prior_terms, back_projected_error, direction_results
+            # The slice pairs that cross a boundary between devices belong to the device before
+            # the boundary.  Each device receives the first slice of the direction of the next
+            # device.
+            if prox_input is None and num_devices > 1:
+                _, delta_right = _sharding.exchange_qggmrf_halos(
+                    _sharding.Shards(delta_recon_per_device, recon_placement),
+                    self.dev2dev_safe)
 
-            # This is the update direction in the sinogram domain.
+                def boundary_worker(i, dev):
+                    indices = pixel_indices_per_device[i]
+                    return _qggmrf.qggmrf_boundary_pair_sum(
+                        flat_recon.tensors[i][indices, -1], halos['right'][i][indices],
+                        delta_recon_per_device[i][:, -1], delta_right[i], qggmrf_params)
+                boundary_devices = [i for i in range(num_devices - 1)
+                                    if delta_right[i] is not None]
+                if boundary_devices:
+                    prior_quadratic = prior_quadratic - combine_on_lead(
+                        [boundary_worker(i, devices[i]) for i in boundary_devices])
+                del delta_right
+            prior_quadratic = prior_quadratic.to(torch.float32)
+
+            # These buffers are freed before the projection of the update, because that projection
+            # uses much more memory.
+            del prior_terms, direction_results
+
             delta_sinogram = self.sparse_forward_project(
                 _sharding.Shards(delta_recon_per_device, recon_placement), pixel_indices)
 
@@ -2462,8 +2386,6 @@ class TomographyModel(ParameterHandler):
                 if const_weights:
                     return lin_quad_const[i](error_sinogram.tensors[i], local_delta_sinogram,
                                              fm_constant)
-                # Fusing the weights into the reductions avoids an array of
-                # sinogram size for each subset.
                 return lin_quad_weighted[i](error_sinogram.tensors[i], local_delta_sinogram,
                                             weights.tensors[i], fm_constant)
             forward_line_terms = _sharding.run_per_device(devices, lin_quad_worker,
@@ -2473,18 +2395,17 @@ class TomographyModel(ParameterHandler):
             forward_quadratic = combine_on_lead(
                 [quadratic for _, quadratic in forward_line_terms])
 
-            # The line search runs on the device.  The step alpha stays a
-            # scalar tensor, so no subset costs a host synchronization.
+            # alpha stays a tensor on the device, so no subset forces a host synchronization.
             alpha_numerator = forward_linear - prior_linear
-            alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
+            alpha_denominator = forward_quadratic + prior_quadratic + _F32_EPS
             alpha = alpha_numerator / alpha_denominator
             alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
             alpha_per_device = ([alpha] if num_devices == 1 else
                          [_sharding.move_shard(alpha, dev, self.dev2dev_safe)
                           for dev in devices])
 
-            # The positivity constraint clips the update so that recon + alpha * delta is at
-            # least zero, and the sinogram projection is then computed again.
+            # The positivity constraint clips the update so that recon + alpha * delta >= 0.  The
+            # projection of the update is then computed again.
             if positivity_flag is True:
                 def positivity_worker(i, dev):
                     recon_at_indices = flat_recon.tensors[i][pixel_indices_per_device[i]]
@@ -2496,56 +2417,58 @@ class TomographyModel(ParameterHandler):
                 delta_sinogram = self.sparse_forward_project(
                     _sharding.Shards(delta_recon_per_device, recon_placement), pixel_indices)
 
-            # The updates are applied in place on each shard.  The sum of
-            # squared updates per slice is the convergence diagnostic.
             def apply_worker(i, dev):
                 delta_scaled = alpha_per_device[i] * delta_recon_per_device[i]
-                _, _, delta_sumsq_local, ell1_local = apply_update[i](
+                _, _, delta_sumsq_local, l1_local = apply_update[i](
                     flat_recon.tensors[i], error_sinogram.tensors[i],
                     pixel_indices_per_device[i], delta_scaled, alpha_per_device[i],
                     delta_sinogram.tensors[i])
-                return delta_sumsq_local, ell1_local
+                return delta_sumsq_local, l1_local
             apply_results = _sharding.run_per_device(devices, apply_worker,
                                                executor=self._per_device_pool)
-            # The per-slice sums are concatenated in global slice order on the
-            # lead device.
             delta_sumsq_subset = (apply_results[0][0] if num_devices == 1
                                   else torch.cat(
                 [_sharding.move_shard(sumsq, dev0, self.dev2dev_safe)
                  for sumsq, _ in apply_results]))
-            ell1_for_subset = combine_on_lead(
-                [ell1 for _, ell1 in apply_results])
-            return (flat_recon, error_sinogram, ell1_for_subset, alpha,
+            l1_for_subset = combine_on_lead(
+                [l1 for _, l1 in apply_results])
+            return (flat_recon, error_sinogram, l1_for_subset, alpha,
                     delta_sumsq_subset)
 
         vcd_subset_updater.stage_halos = stage_halos
+        if prox_input is None:
+            vcd_subset_updater.stage_pair_lists = stage_pair_lists
         return vcd_subset_updater
 
     def vcd_partition_iterator(self, vcd_subset_updater, flat_recon, error_sinogram,
-                               partition, rng=None):
+                               partition, rng=None, pair_lists=None):
         """
-        Calculate a full iteration of the VCD algorithm by scanning over the
-        subsets of the partition, updating flat_recon and error_sinogram in
-        place.
+        This method runs one full iteration of the VCD algorithm over the subsets of the
+        partition.  It updates flat_recon and error_sinogram in place.
 
         Args:
-            rng (numpy.random.Generator, optional): the generator the visiting
-                order is drawn from.  Defaults to None, the global np.random
+            rng (numpy.random.Generator, optional): The generator that draws the order in which
+                the subsets are visited.  Defaults to None, which uses the global np.random
                 state.
+            pair_lists (tuple, optional): The pair lists of the partition from
+                :func:`vcd_utils.gen_neighbor_pair_lists`.  If None, the method makes them.
 
         Returns:
-            (flat_recon, error_sinogram, ell1_for_partition, alpha,
-            delta_sumsq_partition): the updated state, the summed L1 recon
-            change, alpha averaged over the subsets, and the per-slice sum
-            of squared update values over the partition.
+            (flat_recon, error_sinogram, l1_for_partition, alpha, delta_sumsq_partition): The
+            updated recon and error sinogram, the summed L1 norm of the recon change, the
+            average of alpha over the subsets, and the sum of squared updates of each slice over
+            the partition.
         """
-        # The qGGMRF boundary halos are staged once for this whole pass over
-        # the partition.
         if hasattr(vcd_subset_updater, 'stage_halos'):
             vcd_subset_updater.stage_halos(flat_recon)
-        # The subsets are visited in a random order.  Do not change this draw, because
-        # a different random sequence changes the iteration trace that the tests compare against.
-        ell1_for_partition = 0
+        if hasattr(vcd_subset_updater, 'stage_pair_lists'):
+            if pair_lists is None:
+                pair_lists = vcd_utils.gen_neighbor_pair_lists(
+                    partition, self.get_params('recon_shape'))
+            vcd_subset_updater.stage_pair_lists(pair_lists)
+        # This random draw must not change, because the tests compare the values at each
+        # iteration.
+        l1_for_partition = 0
         alpha_sum = 0
         delta_sumsq_partition = 0
         draw = np.random if rng is None else rng
@@ -2553,13 +2476,14 @@ class TomographyModel(ParameterHandler):
 
         for index in subset_indices:
             subset = partition[index]
-            (flat_recon, error_sinogram, ell1_for_subset, alpha_for_subset,
-             delta_sumsq_subset) = vcd_subset_updater(flat_recon, error_sinogram, subset)
-            ell1_for_partition += ell1_for_subset
+            (flat_recon, error_sinogram, l1_for_subset, alpha_for_subset,
+             delta_sumsq_subset) = vcd_subset_updater(flat_recon, error_sinogram, subset,
+                                                      subset_index=index)
+            l1_for_partition += l1_for_subset
             alpha_sum += alpha_for_subset
             delta_sumsq_partition = delta_sumsq_partition + delta_sumsq_subset
 
-        return (flat_recon, error_sinogram, ell1_for_partition,
+        return (flat_recon, error_sinogram, l1_for_partition,
                 alpha_sum / partition.shape[0], delta_sumsq_partition)
 
     def _vcd_recon(self, sinogram, partitions, partition_sequence,
@@ -2568,91 +2492,69 @@ class TomographyModel(ParameterHandler):
                    init_error_sinogram=None, fm_hessian=None,
                    return_checkpoint=False, rng=None):
         """
-        Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
-        Descent algorithm for a given set of partitions and a prescribed
-        partition sequence.
-
-        This is the reconstruction engine that :meth:`recon` and
-        :meth:`prox_map` run, and it is not part of the public interface.  An
-        ordinary reconstruction calls one of those two, which build the
-        partitions, the partition sequence and the regularization first.  This
-        method is described here for advanced users who need the
-        ``init_error_sinogram`` / ``return_checkpoint`` resume workflow
-        below, which the public methods do not offer.
+        This method performs MBIR reconstruction by Multi-Granular Vector Coordinate
+        Descent with the given partitions and partition sequence.  The methods :meth:`recon`
+        and :meth:`prox_map` call this method.  A user needs to call it directly only to resume
+        a run with ``init_error_sinogram`` and ``return_checkpoint``.
 
         Args:
-            sinogram (numpy or tensor or Shards): 3D sinogram data with shape
-                (num_views, num_det_rows, num_det_channels).  The device form
-                as returned by ``prepare_sino_for_devices`` is accepted
-                too, so repeated reconstructions of one large sinogram pay the
-                host-to-device transfer once.
-            partitions (list): K partitions, each an (N_subsets, N_indices)
-                integer index tensor of voxels to update.
-            partition_sequence (ndarray): which partition to use at each
-                iteration.
-            stop_threshold_change_pct (float): stop when the NMAE percent
-                change between iterations falls below this value.
-            weights (numpy or tensor or Shards, optional): 3D positive weights
-                with the same shape as the sinogram, in a plain array or in the
-                device form.  Defaults to all 1s.
-            init_recon (array or int or None): initial reconstruction.  None
-                uses recon_direct; an int gives a constant volume.
-            prox_input (array or Shards, optional): input to a proximal map,
-                as a full volume or in the device form (one shard per device,
-                on this model's recon placement).
-            compute_prior_loss (bool, optional): If True, also compute the
-                prior loss (a debug path for small recons).
-            first_iteration (int, optional): iteration offset for restarts.
-            init_error_sinogram (array or tensor, optional): precomputed error
-                sinogram to resume from, skipping the initializing forward
-                projection.  Requires init_recon, and the pair is trusted as
-                consistent (init_error_sinogram == sinogram - A @ init_recon).
-                No defensive copy is made: both arrays become the loop's
-                working buffers and are updated in place, so after the call
-                they reflect the resumed state.  To keep the pre-resume state,
-                copy before resuming.
-            fm_hessian (array or tensor, optional): precomputed forward-model
-                Hessian diagonal for the same weights and geometry; read-only
-                in the loop.  None computes it internally.
-            return_checkpoint (bool, optional): If True, additionally return
-                {'error_sinogram': ..., 'fm_hessian': ...} for the two
-                arguments above.  The dict references the loop's own final
-                device tensors with no copy; copy them to snapshot or persist.
-            rng (numpy.random.Generator, optional): the generator the order of
-                the subsets is drawn from at each iteration.  Defaults to
-                None, the global np.random state.
+            sinogram (numpy or tensor or Shards): The 3D sinogram, with shape
+                (num_views, num_det_rows, num_det_channels).  It may also be the sinogram on the
+                devices that ``prepare_sino_for_devices`` returns.
+            partitions (list): The K partitions.  Each partition is an integer tensor with shape
+                (N_subsets, N_indices) that holds the indices of the voxels to update.
+            partition_sequence (ndarray): The index of the partition to use at each iteration.
+            stop_threshold_change_pct (float): The method stops when the NMAE change between
+                iterations, in percent, falls below this value.
+            weights (numpy or tensor or Shards, optional): The 3D positive weights, with the
+                same shape as the sinogram.  The weights may be a plain array or on the devices.
+                Defaults to all ones.
+            init_recon (array or int or None): The initial reconstruction.  If None, the method
+                uses ``recon_direct``.  If an int, the method uses a constant volume.
+            prox_input (array or Shards, optional): The input of the proximal map, as a full
+                volume or on the devices.
+            compute_prior_loss (bool, optional): If True, the method also computes the prior
+                loss.  This option is for debugging small recons.
+            first_iteration (int, optional): The iteration number offset for restarts.
+            init_error_sinogram (array or tensor, optional): A precomputed error sinogram,
+                sinogram - A @ init_recon, to resume from.  This argument requires
+                ``init_recon``.  The method updates both arrays in place.  For this reason, a
+                caller who needs the earlier values must copy the arrays first.
+            fm_hessian (array or tensor, optional): A precomputed Hessian diagonal of the forward
+                model, for the same weights and geometry.  If None, the method computes it.
+            return_checkpoint (bool, optional): If True, the method also returns the dict
+                {'error_sinogram': ..., 'fm_hessian': ...}.  The dict holds the tensors that the
+                loop used on the devices, not copies.
+            rng (numpy.random.Generator, optional): The generator that draws the order of the
+                subsets at each iteration.  Defaults to None, which uses the global np.random
+                state.
 
         Returns:
-            (recon, recon_stats): the 3D reconstruction tensor and a tuple of
-            per-iteration stats (fm_rmse, pm_loss, nmae_update, alpha_values,
+            (recon, recon_stats): The 3D reconstruction tensor and a tuple of statistics for
+            each iteration.  The tuple is (fm_rmse, pm_loss, nmae_update, alpha_values,
             delta_norm_per_slice), where nmae_update is
-            ||recon(i+1) - recon(i)||_1 / ||recon(i+1)||_1.
-            With return_checkpoint=True: (recon, recon_stats, checkpoint).
+            ||recon(i+1) - recon(i)||_1 / ||recon(i+1)||_1.  If ``return_checkpoint`` is True,
+            the method returns (recon, recon_stats, checkpoint).
         """
         self.verify_valid_params()
         dev = self.torch_device
         recon_shape = self.get_params('recon_shape')
         sinogram_shape = self.get_params('sinogram_shape')
         if isinstance(sinogram, _sharding.Shards):
-            # The container has no shape of its own, so the shard tensors are
-            # checked instead.
             self._check_sinogram_shards(sinogram, sinogram_shape)
         elif tuple(sinogram.shape) != tuple(sinogram_shape):
             raise ValueError('sinogram does not have the shape in sinogram_shape. \n'
                              f'Expected {tuple(sinogram_shape)}, got '
                              f'{tuple(sinogram.shape)}.')
 
-        # The device layout is settled before the first large allocation.
-        memory_ledger = self._apply_device_policy(
+        # The GPUs must be chosen before the first large allocation.
+        memory_estimate = self._apply_device_policy(
             partition_sequence=partition_sequence, weights=weights,
             init_recon=init_recon, fm_hessian=fm_hessian,
             prox_input=prox_input, init_error_sinogram=init_error_sinogram)
-        if _memory_ledger.calibration_enabled():
-            # The measured run begins here, so the peak memory counters are
-            # reset here, once per reconstruction.
-            _memory_ledger.calibration_start(self.sino_placement.devices)
-        # The layout is final here, so the log can now name the devices the run
-        # will use.
+        if _memory_estimate.calibration_enabled():
+            # The peak memory counters are reset here, once per reconstruction.
+            _memory_estimate.calibration_start(self.sino_placement.devices)
         self._log_device_report()
 
         constant_weights = weights is None
@@ -2665,8 +2567,7 @@ class TomographyModel(ParameterHandler):
             raise ValueError('init_error_sinogram requires init_recon (the pair must be a '
                              'consistent resume state; see the docstring).')
 
-        # When resuming, the error sinogram replaces the only use of the
-        # sinogram, so the sinogram is not placed on the devices.
+        # When the run resumes, the sinogram is not copied to the devices.
         if init_error_sinogram is None:
             sinogram = self._shard_sinogram(sinogram)
 
@@ -2683,8 +2584,7 @@ class TomographyModel(ParameterHandler):
             init_recon = self._shard_recon(init_recon)
 
         if init_error_sinogram is not None:
-            # The pair is trusted, so the initializing forward projection is
-            # skipped.  The caller's arrays become the loop's working buffers.
+            # The loop uses the caller's arrays as its working arrays.
             self.logger.info('Resuming from init_error_sinogram')
             error_sinogram = self._shard_sinogram(init_error_sinogram)
         else:
@@ -2692,19 +2592,15 @@ class TomographyModel(ParameterHandler):
                 sinogram, init_recon, weights, constant_weights,
                 scale_recon_to_sinogram)
 
-        # The sinogram is now folded into the error sinogram, so dropping this
-        # reference frees any device copy made above.
         sinogram = None
         error_sinogram = self._shard_sinogram(error_sinogram)
 
         if prox_input is not None:
             if isinstance(prox_input, _sharding.Shards):
-                # The container has no shape of its own, so the shard tensors
-                # are flattened and checked instead.
                 prox_input = self._flatten_prox_shards(prox_input, recon_shape)
             else:
-                # The shape is checked before flattening, so that an input with the right
-                # number of elements but the wrong shape raises rather than being reshaped.
+                # The shape is checked before the reshape, so an input with the wrong shape
+                # raises an error.
                 if tuple(prox_input.shape) != tuple(recon_shape):
                     raise ValueError('prox_input does not have the correct size. \n'
                                      f'Expected {tuple(recon_shape)}, got shape '
@@ -2714,20 +2610,17 @@ class TomographyModel(ParameterHandler):
 
         verbose, sigma_y = self.get_params(['verbose', 'sigma_y'])
 
-        # math.prod uses exact Python integers.  np.prod would wrap past
-        # 2^31 elements.
+        # np.prod would overflow past 2^31 elements.
         total_sino_size = math.prod(sinogram_shape)
 
-        # The Hessian diagonal of the forward model is the back projection of the weights with
-        # squared coefficients.  A Hessian supplied by the caller skips that back projection.
         if fm_hessian is None:
             if constant_weights:
                 hess_weights = self._sino_ones_device_form(error_sinogram)
             else:
                 hess_weights = weights
             self.logger.info('Computing Hessian diagonal')
-            # The back projection covers only the masked pixels.  The loop reads the Hessian only
-            # at partition indices from the same mask, so the values are unchanged.
+            # The loop reads the Hessian only at pixels inside the mask, so only those pixels
+            # are computed.
             hess_indices = (None if self.get_params('use_ror_mask') is False
                             else self.full_indices_device())
             fm_hessian = self.compute_hessian_diagonal(weights=hess_weights,
@@ -2740,8 +2633,7 @@ class TomographyModel(ParameterHandler):
 
         flat_recon = self._flatten_recon(init_recon)
 
-        # From here the loop runs one code path for any device count.  On a single device the
-        # one shard container aliases its tensor, so in place updates reach the caller's array.
+        # On one device, the container with one shard shares memory with the caller's array.
         flat_recon = self._as_shards(flat_recon, self.recon_placement)
         error_sinogram = self._as_shards(error_sinogram,
                                              self.sino_placement)
@@ -2751,9 +2643,9 @@ class TomographyModel(ParameterHandler):
 
         self.logger.info('Starting VCD iterations')
         if verbose >= 2:
-            if memory_ledger is not None:
+            if memory_estimate is not None:
                 self.logger.debug('Modeled peak device memory by phase:')
-                self.logger.debug(memory_ledger.format_table())
+                self.logger.debug(memory_estimate.format_table())
                 self.logger.debug('--------')
             output = io.StringIO()
             get_memory_stats(file=output)
@@ -2761,6 +2653,8 @@ class TomographyModel(ParameterHandler):
             self.logger.debug('--------')
 
         max_iters = partition_sequence.size
+        # The pair lists of each partition are made once, when the partition is first used.
+        pair_lists = {}
         fm_rmse = np.zeros(max_iters)
         pm_loss = np.zeros(max_iters)
         nmae_update = np.zeros(max_iters)
@@ -2768,28 +2662,26 @@ class TomographyModel(ParameterHandler):
         delta_norm_per_slice = np.zeros((max_iters, recon_shape[2]))
         num_iters = 0
         if not self.sino_placement.is_trivial:
-            # One thread pool serves the whole loop.  A single device model
-            # never creates one.
             self._per_device_pool = _sharding.device_pool(
                 self.sino_placement.n_devices)
         try:
             for i in range(max_iters):
                 partition = partitions[partition_sequence[i]]
-                (flat_recon, error_sinogram, ell1_for_partition, alpha,
+                if prox_input is None and partition_sequence[i] not in pair_lists:
+                    pair_lists[partition_sequence[i]] = vcd_utils.gen_neighbor_pair_lists(
+                        partition, recon_shape)
+                (flat_recon, error_sinogram, l1_for_partition, alpha,
                  delta_sumsq_partition) = self.vcd_partition_iterator(
                     vcd_subset_updater, flat_recon, error_sinogram, partition,
-                    rng=rng)
+                    rng=rng, pair_lists=pair_lists.get(partition_sequence[i]))
 
-                # The element count is passed in, because a sharded error sinogram is a list
-                # of tensors and the statistics normalize by the total element count.
                 fm_loss_i, recon_l1, es_rmse = self._iteration_stats(
                     error_sinogram, flat_recon, sigma_y, weights,
                     constant_weights, float(total_sino_size))
                 fm_rmse[i] = float(fm_loss_i)
                 recon_l1_f = float(recon_l1)
-                # A reconstruction of all zeros gives nan rather than raising
-                # ZeroDivisionError.
-                nmae_update[i] = (float(ell1_for_partition) / recon_l1_f
+                # A reconstruction of all zeros gives nan rather than ZeroDivisionError.
+                nmae_update[i] = (float(l1_for_partition) / recon_l1_f
                                   if recon_l1_f else float('nan'))
                 alpha_values[i] = float(alpha)
                 delta_norm_per_slice[i] = np.sqrt(
@@ -2806,15 +2698,12 @@ class TomographyModel(ParameterHandler):
                             ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
                         b = _qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts)
                         qggmrf_params = (b, sigma_x, p, q, T)
-                        # The prior loss is evaluated on the assembled volume,
-                        # so that terms between slices cross shard boundaries.
+                        # The prior loss is computed on the full volume gathered from the devices.
                         total_recon_size = math.prod(recon_shape)
                         loss_recon = self._gather_recon(flat_recon).reshape(
                             tuple(recon_shape))
                         pm_loss[i] = _qggmrf.qggmrf_loss(loss_recon, qggmrf_params)
                         pm_loss[i] /= total_recon_size
-                        # Each loss arrives scaled by its own element count.  Both are
-                        # unscaled, added, and rescaled by the average element count.
                         total_loss = ((fm_rmse[i] * total_sino_size
                                        + pm_loss[i] * total_recon_size)
                                       / (0.5 * (total_sino_size + total_recon_size)))
@@ -2838,17 +2727,15 @@ class TomographyModel(ParameterHandler):
                 self._per_device_pool.shutdown(wait=True)
                 self._per_device_pool = None
 
-        # The calibration comparison runs before the loop's state is released,
-        # so that the measured peak still reflects the reconstruction.
-        if memory_ledger is not None and _memory_ledger.calibration_enabled():
-            rows = _memory_ledger.calibration_report(
-                memory_ledger, self.sino_placement.devices)
+        # This code must run before the loop releases its arrays, so that the measured peak is
+        # correct.
+        if memory_estimate is not None and _memory_estimate.calibration_enabled():
+            rows = _memory_estimate.calibration_report(
+                memory_estimate, self.sino_placement.devices)
             self.last_memory_calibration = rows
             if rows:
-                self.logger.warning(_memory_ledger.format_calibration(rows))
+                self.logger.warning(_memory_estimate.format_calibration(rows))
 
-        # The state returns to the device form here.  On a single device that
-        # is a plain tensor, and it is the same object the loop updated.
         flat_recon = self._as_device_form(flat_recon)
         error_sinogram = self._as_device_form(error_sinogram)
         recon_3d = self._recon_from_flat(flat_recon, recon_shape)
@@ -2864,20 +2751,19 @@ class TomographyModel(ParameterHandler):
                          logfile_path='~/.mbirtorch/logs/recon.log',
                          print_logs=True, rng=None):
         """
-        Do the parameter initialization needed for recon: generate the set of
-        voxel partitions and the partition sequence, validate the inputs, and
-        run auto-regularization.
+        This method prepares a run of :meth:`recon`.  It generates the voxel partitions and
+        the partition sequence, checks the inputs, and sets the regularization automatically.
 
         Args:
-            See :meth:`recon` for arguments.  ``rng`` is the generator the
-            partitions are drawn from; None uses the global np.random state.
+            The same as :meth:`recon`.  ``rng`` is the generator that draws the partitions.
+            If ``rng`` is None, the method uses the global np.random state.
 
         Returns:
             sinogram, weights, init_recon, partitions, partition_sequence,
             granularity, regularization_params
         """
-        # The run logger is set up when a run is initialized.  A Plug and Play loop that passes
-        # do_initialization=False skips this method, so the whole loop writes to one log.
+        # A Plug-and-Play loop that passes do_initialization=False skips this method.  As a
+        # result, the whole loop writes one log.
         self._log_run_header(first_iteration, logfile_path, print_logs)
         recon_shape, granularity, use_ror_mask = self.get_params(
             ['recon_shape', 'granularity', 'use_ror_mask'])
@@ -2890,8 +2776,7 @@ class TomographyModel(ParameterHandler):
             partition_sequence, max_iterations=max_iterations)
         partition_sequence = partition_sequence[first_iteration:]
 
-        # The input checks run where the data already is.  A sharded sinogram is checked one
-        # shard at a time on the device that holds it, and never brought back to the host.
+        # A sharded sinogram is checked on the devices that hold it.
         if isinstance(sinogram, _sharding.Shards):
             for tensor in sinogram.tensors:
                 if tensor.is_complex():
@@ -2900,8 +2785,6 @@ class TomographyModel(ParameterHandler):
                 low, high = _array_extremes(tensor)
                 if not (math.isfinite(low) and math.isfinite(high)):
                     raise ValueError("sinogram contains NaN and/or Inf values.")
-            # The statistics below reduce this to a small subsample of the
-            # views before anything reaches the host.
             sinogram_for_stats = sinogram
         else:
             sinogram_np = np.asarray(sinogram) if not torch.is_tensor(sinogram) \
@@ -2914,7 +2797,6 @@ class TomographyModel(ParameterHandler):
             sinogram_for_stats = sinogram_np
         if weights is not None:
             if isinstance(weights, _sharding.Shards):
-                # The weights are all zero only when every shard is all zero.
                 all_zero = True
                 for tensor in weights.tensors:
                     low, high = _array_extremes(tensor)
@@ -2946,51 +2828,57 @@ class TomographyModel(ParameterHandler):
               logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
               output_sharded=False, rng=None):
         """
-        Reconstruct a volume from a sinogram by MBIR.
+        This method reconstructs a volume from a sinogram by MBIR.
 
-        The reconstruction runs the Multi-Granular Vector Coordinate Descent algorithm for up to
-        ``max_iterations`` iterations, or until the change between iterations falls below
-        ``stop_threshold_change_pct``.  On a machine with several GPUs it uses them by itself
-        (see :meth:`~mbirtorch.TomographyModel.configure_devices`).  The pixel partitions and their order are drawn from
-        numpy's random number generator, so two runs differ slightly; call ``np.random.seed`` first
-        or pass ``rng`` for the same result every time.
+        The method runs the Multi-Granular Vector Coordinate Descent algorithm for up to
+        ``max_iterations`` iterations.  It stops early if the change between iterations falls
+        below ``stop_threshold_change_pct``.  The pixel partitions are drawn at random, so two
+        runs differ slightly.  The user can make the result repeatable with ``np.random.seed``
+        or ``rng``.
 
         Args:
-            sinogram (numpy or tensor): 3D sinogram with shape (num_views, num_det_rows, num_det_channels).
-            weights (numpy or tensor, optional): positive weights of the same shape.  Defaults to None (all 1s).
-            init_recon (array, optional): initial reconstruction.  Defaults to None, a direct reconstruction.
-            max_iterations (int, optional): maximum number of iterations.  Defaults to 15.
-            stop_threshold_change_pct (float, optional): stop when the percent change in the volume between
-                iterations drops below this value.  Defaults to 0.2; set 0 to run exactly max_iterations.
-            first_iteration (int, optional): to continue a reconstruction, the number of iterations already
-                done, with ``init_recon`` the previous result.  Defaults to 0.
-            logfile_path (str, optional): path of the log file.  Defaults to '~/.mbirtorch/logs/recon.log';
-                None writes no file.
-            print_logs (bool, optional): print the log to the console.  Defaults to True.
-            output_sharded (bool, optional): return the volume on the devices instead of as a numpy array.
-                Defaults to False.
-            rng (numpy.random.Generator, optional): the generator for every random draw of the run.
-                Defaults to None, the global numpy state.
+            sinogram (numpy or tensor): The 3D sinogram, with shape (num_views, num_det_rows,
+                num_det_channels).
+            weights (numpy or tensor, optional): The positive weights, with the same shape as
+                the sinogram.  Defaults to None, which means all ones.
+            init_recon (array, optional): The initial reconstruction.  Defaults to None, which
+                means a direct reconstruction.
+            max_iterations (int, optional): The maximum number of iterations.  Defaults to 15.
+            stop_threshold_change_pct (float, optional): The method stops when the percent
+                change in the volume between iterations drops below this value.  Defaults to
+                0.2.  The value 0 runs exactly ``max_iterations`` iterations.
+            first_iteration (int, optional): The number of iterations already done, when the
+                user continues a reconstruction.  In this case, ``init_recon`` is the previous
+                result.  Defaults to 0.
+            logfile_path (str, optional): The path of the log file.  Defaults to
+                '~/.mbirtorch/logs/recon.log'.  If None, the method writes no log file.
+            print_logs (bool, optional): If True, the method prints the log to the console.
+                Defaults to True.
+            output_sharded (bool, optional): If True, the method returns the volume on the
+                devices instead of as a numpy array.  Defaults to False.
+            rng (numpy.random.Generator, optional): The generator for every random draw of the
+                run.  Defaults to None, which uses the global numpy state.
 
         Returns:
-            (recon, recon_dict): the reconstruction volume, and a dict with entries 'recon_params'
-            (settings and per-iteration traces), 'recon_log' (the log text), 'notes', and 'model_params'
-            (the model parameters).  The dict can be given to :func:`~mbirtorch.view_utils.slice_viewer`
-            and :func:`~mbirtorch.export_recon_hdf5`.
+            (recon, recon_dict): The reconstructed volume and a dict.  The dict has the entries
+            'recon_params', 'recon_log', 'notes', and 'model_params'.  The entry 'recon_params'
+            holds the settings and the values at each iteration.  The entry 'recon_log' holds
+            the log text, and 'model_params' holds the model parameters.  The user can pass the
+            dict to :func:`~mbirtorch.view_utils.slice_viewer` and
+            :func:`~mbirtorch.export_recon_hdf5`.
 
         Example:
             >>> recon, recon_dict = ct_model.recon(sinogram, weights=weights)
         """
-        # The initial reconstruction is checked against the shape of the whole volume, which a
-        # sharded array does not have, so a sharded init_recon is refused.
+        # A sharded init_recon is refused, because the code cannot check its full shape.
         _sharding.reject_shards('recon', init_recon=init_recon)
         (sinogram, weights, init_recon, partitions, partition_sequence, granularity,
          regularization_params) = self.initialize_recon(
             sinogram, weights, init_recon, max_iterations, first_iteration,
             logfile_path=logfile_path, print_logs=print_logs, rng=rng)
 
-        # This uses no_grad rather than inference_mode, because torch.compile guards fail on
-        # compiled calls with in place updates inside inference_mode.
+        # torch.compile fails on in-place updates inside inference_mode, so the code uses
+        # no_grad.
         with torch.no_grad():
             recon, loss_vectors = self._vcd_recon(
                 sinogram, partitions, partition_sequence,
@@ -3014,8 +2902,7 @@ class TomographyModel(ParameterHandler):
                 os.path.abspath(os.path.expanduser(logfile_path))))
         for h in list(self.logger.handlers):
             h.flush()
-        # This call has written its last line, so the log file is closed.  A call that continues
-        # this run reopens it.
+        # A later call that continues this run reopens the log file.
         self.close_log_file()
 
         notes = 'Reconstruction completed: {}\n\n'.format(datetime.datetime.now())
@@ -3024,27 +2911,20 @@ class TomographyModel(ParameterHandler):
 
     def _iteration_stats(self, error_sinogram, flat_recon, sigma_y, weights,
                          constant_weights, total_sino_size):
-        """Return the per-iteration statistics (forward model loss, the L1 norm
-        of the reconstruction, and the error sinogram RMSE).
-
-        A single device state calls _vcd_iteration_stats.  A state spread over
-        devices combines the shard sums on the host, which is the loop's one
-        host synchronization per iteration.  ``total_sino_size`` is the element
-        count of the whole sinogram, which no single shard knows."""
+        """This method returns the statistics of one iteration.  These are the forward model
+        loss, the L1 norm of the reconstruction, and the RMSE of the error sinogram."""
         if (isinstance(error_sinogram, _sharding.Shards)
                 and not error_sinogram.placement.is_trivial):
             error_shards, flat_shards = error_sinogram, flat_recon
             weights_shards = None if constant_weights else weights
 
             def sino_worker(i, d):
-                # The sums run in chunks on each shard, so no array the size of
-                # a shard is allocated.
                 e = error_shards.tensors[i]
-                sq = float(_memory_ledger.weighted_square_sum(e))
+                sq = float(_memory_estimate.weighted_square_sum(e))
                 if weights_shards is None:
                     return sq, 0.0, sq
                 w = weights_shards.tensors[i]
-                return (float(_memory_ledger.weighted_square_sum(e, w)),
+                return (float(_memory_estimate.weighted_square_sum(e, w)),
                         float(torch.sum(w)), sq)
             parts = _sharding.run_per_device(error_shards.placement.devices,
                                              sino_worker)
@@ -3057,12 +2937,11 @@ class TomographyModel(ParameterHandler):
             fm_loss = ((weighted_sq / (avg_weight * total_sino_size)) ** 0.5
                        / sigma_y)
             recon_l1 = sum(
-                float(_memory_ledger.image_ell1(t))
+                float(_memory_estimate.image_l1_norm(t))
                 for t in flat_shards.tensors)
             es_rmse = (sq / total_sino_size) ** 0.5
         else:
             if isinstance(error_sinogram, _sharding.Shards):
-                # A one shard container unwraps to the tensor it aliases.
                 error_sinogram = error_sinogram.tensors[0]
                 flat_recon = flat_recon.tensors[0]
             fm_loss, recon_l1, es_rmse = TomographyModel._vcd_iteration_stats(
@@ -3074,18 +2953,13 @@ class TomographyModel(ParameterHandler):
                         logfile_path='~/.mbirtorch/logs/prox.log',
                         print_logs=True, rng=None):
         """
-        Do the initialization of :meth:`prox_map` and store it in
-        ``prox_data``, which later calls of ``prox_map`` reuse.
-
-        Call this to initialize with one generator and then sweep with
-        another, which is what makes a Plug-and-Play loop draw the same
-        partitions whatever thread runs its first iteration.  ``prox_map``
-        calls this itself on a call that asks for initialization or finds no
-        cache.
+        This method prepares :meth:`prox_map` and stores the result in ``prox_data``.  Later
+        calls of ``prox_map`` reuse this result.  The method ``prox_map`` calls this method when
+        the caller asks for initialization or when there is no stored result.
 
         Args:
-            Multiple: see :meth:`prox_map` for arguments.  ``rng`` is the generator the
-              partitions are drawn from; None uses the global np.random state.
+            The same as :meth:`prox_map`.  ``rng`` is the generator that draws the partitions.
+            If ``rng`` is None, the method uses the global np.random state.
 
         Returns:
             sinogram, weights, init_recon, partitions, partition_sequence,
@@ -3094,8 +2968,8 @@ class TomographyModel(ParameterHandler):
         initialized = self.initialize_recon(
             sinogram, weights, init_recon, max_iterations, first_iteration,
             logfile_path=logfile_path, print_logs=print_logs, rng=rng)
-        # The cache holds the last four entries: the partitions, the partition
-        # sequence, the granularity, and the regularization parameters.
+        # The stored entries are the partitions, the partition sequence, the granularity, and the
+        # regularization parameters.
         self.prox_data = tuple(initialized[3:])
         return initialized
 
@@ -3106,43 +2980,51 @@ class TomographyModel(ParameterHandler):
                  logfile_path='~/.mbirtorch/logs/prox.log', print_logs=True,
                  output_sharded=False, rng=None):
         """
-        Compute the proximal map of the data term, for Plug-and-Play loops.
+        This method computes the proximal map of the data term for Plug-and-Play loops.
 
-        This is :meth:`recon` with the prior replaced by a Gaussian of mean ``prox_input`` and
-        standard deviation ``sigma_prox``.  A Plug-and-Play loop alternates this method with a
-        denoiser.  The random draws are as in :meth:`recon`.
+        The method is the same as :meth:`recon`, except that a Gaussian prior replaces the
+        usual prior.  The Gaussian has mean ``prox_input`` and standard deviation
+        ``sigma_prox``.  A Plug-and-Play loop alternates this method with a denoiser.
 
         Args:
-            prox_input (numpy or tensor): the proximal map input, with the shape of the reconstruction.
-            sinogram (numpy or tensor): 3D sinogram with shape (num_views, num_det_rows, num_det_channels).
-            sigma_prox (float, optional): standard deviation of the prior.  Defaults to None, set from the sinogram.
-            weights (numpy or tensor, optional): positive weights of the same shape as the sinogram.
-                Defaults to None (all 1s).
-            init_recon (numpy or tensor, optional): initial reconstruction.  Defaults to None.
-            do_initialization (bool, optional): set False after the first call of a loop on the same
-                sinogram, so the partitions and regularization are not computed again.  Defaults to True.
-            stop_threshold_change_pct (float, optional): stop when the percent change between iterations
-                drops below this value.  Defaults to 0.2.
-            max_iterations (int, optional): maximum number of iterations, counted from iteration 0.
-                Defaults to 3.
-            first_iteration (int, optional): the total number of proximal map iterations done so far in
-                the loop, which continues the partition sequence.  Defaults to 0.
-            logfile_path (str, optional): path of the log file.  Defaults to '~/.mbirtorch/logs/prox.log';
-                None writes no file.
-            print_logs (bool, optional): print the log to the console.  Defaults to True.
-            output_sharded (bool, optional): return the volume on the devices instead of as a numpy array,
-                which a loop can pass to a denoiser on the same devices.  Defaults to False.
-            rng (numpy.random.Generator, optional): the generator for every random draw.  Defaults to
-                None, the global numpy state.
+            prox_input (numpy or tensor): The input of the proximal map, with the shape of the
+                reconstruction.
+            sinogram (numpy or tensor): The 3D sinogram, with shape (num_views, num_det_rows,
+                num_det_channels).
+            sigma_prox (float, optional): The standard deviation of the prior.  Defaults to
+                None, which means the value is set from the sinogram.
+            weights (numpy or tensor, optional): The positive weights, with the same shape as
+                the sinogram.  Defaults to None, which means all ones.
+            init_recon (numpy or tensor, optional): The initial reconstruction.  Defaults to
+                None.
+            do_initialization (bool, optional): The user sets this to False after the first call
+                of a loop on the same sinogram.  In that case, the method does not compute the
+                partitions and the regularization again.  Defaults to True.
+            stop_threshold_change_pct (float, optional): The method stops when the percent
+                change between iterations drops below this value.  Defaults to 0.2.
+            max_iterations (int, optional): The maximum number of iterations, counted from
+                iteration 0.  Defaults to 3.
+            first_iteration (int, optional): The total number of proximal map iterations done so
+                far in the loop.  The method uses it to continue the partition sequence.
+                Defaults to 0.
+            logfile_path (str, optional): The path of the log file.  Defaults to
+                '~/.mbirtorch/logs/prox.log'.  If None, the method writes no log file.
+            print_logs (bool, optional): If True, the method prints the log to the console.
+                Defaults to True.
+            output_sharded (bool, optional): If True, the method returns the volume on the
+                devices instead of as a numpy array.  A loop can pass this volume to a denoiser
+                on the same devices.  Defaults to False.
+            rng (numpy.random.Generator, optional): The generator for every random draw.
+                Defaults to None, which uses the global numpy state.
 
         Returns:
-            (recon, recon_dict): the volume and a dict with the entries of :meth:`recon`.
+            (recon, recon_dict): The volume and a dict with the same entries as in
+            :meth:`recon`.
 
         Example:
             >>> recon, _ = ct_model.prox_map(prox_input, sinogram, sigma_prox=0.5)
         """
-        # The initial reconstruction is checked against the shape of the whole volume, which a
-        # sharded array does not have, so a sharded init_recon is refused.
+        # A sharded init_recon is refused, because the code cannot check its full shape.
         _sharding.reject_shards('prox_map', init_recon=init_recon)
         prior_loss = [0]
         if do_initialization or self.prox_data is None:
@@ -3153,21 +3035,17 @@ class TomographyModel(ParameterHandler):
         else:
             (partitions, partition_sequence, granularity,
              regularization_params) = self.prox_data
-            # The cache is dropped by a change of the device layout, and by nothing else: a
-            # change of granularity, partition_sequence, or use_ror_mask leaves it in place.
-            # The QGGMRFDenoiser cache checks those three and redraws when they move.
-            # The cache holds the pixel partitions and the regularization estimates, which are
-            # expensive.  The partition sequence is cheap and is recomputed here the same way.
+            # A change of the devices or of the geometry clears this stored result.  The
+            # partition sequence is computed again.
             partition_sequence = vcd_utils.gen_partition_sequence(
                 self.get_params('partition_sequence'),
                 max_iterations=max_iterations)
             partition_sequence = partition_sequence[first_iteration:]
-            # This pass skips the initialization, and with it the run header that reopens
-            # the log file the previous pass closed, so the file is reopened here.
+            # This call skipped the run header, which normally reopens the log file.  For this
+            # reason, the code reopens the log file here.
             self._reopen_log_file()
 
-        # A supplied sigma_prox overrides the automatic value, and the
-        # automatic value is restored at the end of the call.
+        # A sigma_prox from the caller overrides the automatic value until the end of the call.
         self_sigma_prox = self.get_params('sigma_prox')
         if sigma_prox is not None:
             regularization_params = dict(regularization_params,
@@ -3199,7 +3077,6 @@ class TomographyModel(ParameterHandler):
                 os.path.abspath(os.path.expanduser(logfile_path))))
         for h in list(self.logger.handlers):
             h.flush()
-        # The log file is closed here and reopened by the next pass.
         self.close_log_file()
 
         notes = 'Proximal map completed: {}\n\n'.format(datetime.datetime.now())
@@ -3212,25 +3089,19 @@ class TomographyModel(ParameterHandler):
 
     def resize_recon_fov(self, row_scale=1.0, col_scale=1.0, slice_scale=1.0):
         """
-        Resize the reconstruction field of view (FOV) by the given scale factors.
-
-        The voxel size stays the same; the number of voxels in each direction is
-        multiplied by its scale factor.  This can be used before starting a
-        reconstruction to improve results when part of the object projects
-        outside the detector.  The method updates the internal `recon_shape`
-        parameter.
-
-        For lateral FOV truncation (flagged by the "Lateral FOV truncation
-        detected" warning), use ``resize_recon_fov(s, s)`` with ``s``
-        typically chosen as ``s >= 1.1``.
+        This method resizes the reconstruction field of view (FOV) by the given scale
+        factors.  The voxel size does not change, and the method updates ``recon_shape``.
+        After the warning "Lateral FOV truncation detected", a typical call is
+        ``resize_recon_fov(s, s)`` with ``s >= 1.1``.
 
         Args:
-            row_scale (float): Scale factor for the number of recon rows.
-            col_scale (float): Scale factor for the number of recon columns.
-            slice_scale (float): Scale factor for the number of recon slices.
+            row_scale (float): The scale factor for the number of recon rows.
+            col_scale (float): The scale factor for the number of recon columns.
+            slice_scale (float): The scale factor for the number of recon slices.
 
         Returns:
-            tuple[int, int, int]: voxels added to (rows, columns, slices).
+            tuple[int, int, int]: The number of voxels added to the rows, the columns, and the
+            slices.
         """
         old_rows, old_cols, old_slices = self.get_params('recon_shape')
         new_rows = int(old_rows * row_scale)
@@ -3240,26 +3111,20 @@ class TomographyModel(ParameterHandler):
         return new_rows - old_rows, new_cols - old_cols, new_slices - old_slices
 
     def scale_recon_shape(self, row_scale=1.0, col_scale=1.0, slice_scale=1.0):
-        # Deprecated name for resize_recon_fov; kept so old scripts keep running.
         warnings.warn('scale_recon_shape is deprecated; use resize_recon_fov instead.', FutureWarning, stacklevel=2)
         return self.resize_recon_fov(row_scale, col_scale, slice_scale)
 
     def recon_slice_z(self, slice_indices=None):
-        """The axial coordinate, in ALU, of the center of each recon slice.
-
-        Slices are spaced by the slice pitch ``voxel_slice_aspect * delta_voxel``
-        and centered on ``recon_slice_offset``, which is zero for a geometry
-        that has no such parameter.  This is the one host-side statement of
-        the map the projectors use: the compiled cone and multiaxis bodies
-        write the same expression in ``_cone_vertical_affine`` and
-        ``_multiaxis_vertical_terms``, where a Python call cannot be traced.
+        """This method returns the axial coordinate, in ALU, of the center of each recon
+        slice.  The slices are spaced by ``voxel_slice_aspect * delta_voxel``, and they are
+        centered on ``recon_slice_offset``.
 
         Args:
-            slice_indices (int, sequence of int, or None): the slices to map.
-                None (the default) maps every slice.
+            slice_indices (int, sequence of int, or None): The slices to map.  If None (the
+                default), the method maps every slice.
 
         Returns:
-            float or ndarray: the coordinate of each requested slice.
+            float or ndarray: The coordinate of each requested slice.
         """
         recon_shape = self.get_params('recon_shape')
         delta_voxel, voxel_slice_aspect = self.get_params(['delta_voxel', 'voxel_slice_aspect'])
@@ -3269,10 +3134,8 @@ class TomographyModel(ParameterHandler):
         return voxel_slice_aspect * delta_voxel * (k - (num_slices - 1) / 2.0) + offset
 
     def _fractional_slice_index(self, z):
-        """Return the fractional reconstruction slice index of the axial
-        coordinate ``z``.  This inverts :meth:`recon_slice_z` without rounding.
-        The argument may be a float, a numpy array, or a torch tensor, and the
-        result has the same form."""
+        """This method returns the fractional slice index of the axial coordinate ``z``.  This
+        method is the inverse of :meth:`recon_slice_z`.  The result has the same type as ``z``."""
         recon_shape = self.get_params('recon_shape')
         delta_voxel, voxel_slice_aspect = self.get_params(['delta_voxel', 'voxel_slice_aspect'])
         offset = self.get_params('recon_slice_offset') if 'recon_slice_offset' in self.params else 0.0
@@ -3280,19 +3143,16 @@ class TomographyModel(ParameterHandler):
         return (z - offset) / (voxel_slice_aspect * delta_voxel) + (num_slices - 1) / 2.0
 
     def nearest_recon_slice(self, z):
-        """The index of the recon slice whose center is nearest the axial
-        coordinate ``z`` in ALU, clipped to the volume.  The inverse of
-        :meth:`recon_slice_z`."""
+        """This method returns the index of the recon slice whose center is nearest to the
+        axial coordinate ``z`` in ALU.  The method clips the index to the volume.  This method is
+        the inverse of :meth:`recon_slice_z`."""
         num_slices = int(self.get_params('recon_shape')[2])
         index = int(round(float(self._fractional_slice_index(z))))
         return min(max(index, 0), num_slices - 1)
 
     def reshape_recon(self, recon):
-        """Reshape a recon-like array to the model's ``recon_shape``.
-
-        The target shape names the WHOLE volume's slice count, which no single
-        shard has, so a divided array is refused rather than reshaped shard by
-        shard against a slice count that is not its own.
+        """This method reshapes a recon-shaped array to the ``recon_shape`` of the model.  The
+        method does not accept a sharded array.
         """
         _sharding.reject_shards('reshape_recon', recon=recon)
         recon_shape = self.get_params('recon_shape')
@@ -3302,35 +3162,24 @@ class TomographyModel(ParameterHandler):
 
     def get_all_params(self):
         """
-        Return this model's parameters as ``(required_params, optional_params, regularization)``.
+        This method returns the parameters of this model as three dicts,
+        ``(required_params, optional_params, regularization)``.
 
-        This is the single source of truth for reading a model's parameters back out.  The three
-        dicts partition the parameters so a caller can reconstruct or serialize the model and choose
-        which parts to apply:
-
-        * **required_params** -- the geometry arguments the model constructor takes, with the
-          view-dependent arguments reconstructed from storage (e.g. cone's ``angles`` and
-          ``helical_z_shifts``), plus a ``geometry_type`` entry so the model class can be
-          resolved.  The execution-environment constructor arguments (``view_batch_size``,
-          ``compile_mode``) are not model parameters and are excluded.
-        * **optional_params** -- the remaining geometry/detector parameters that are applied with
-          ``set_params`` (detector pitches, offsets, ``delta_voxel``, ``recon_shape``, voxel aspects).
-        * **regularization** -- the regularization parameters (``sigma_y``, ``sigma_x``,
-          ``sigma_prox``, ``snr_db``, ``sharpness``, ``auto_regularize_flag``), separated so a
-          consumer can drop them and let them be re-chosen at reconstruction time.
+        The dict ``required_params`` holds the geometry arguments of the constructor and
+        ``geometry_type``.  The dict ``optional_params`` holds the other geometry and detector
+        parameters, which ``set_params`` applies.  The dict ``regularization`` holds
+        ``sigma_y``, ``sigma_x``, ``sigma_prox``, ``snr_db``, ``sharpness``, and
+        ``auto_regularize_flag``.
 
         Returns:
-            tuple: ``(required_params, optional_params, regularization)`` -- three dicts of values.
+            tuple: ``(required_params, optional_params, regularization)``.
         """
         import inspect
 
         regularization_names = _AUTO_REGULARIZATION_PARAM_NAMES + (
             'snr_db', 'sharpness', 'auto_regularize_flag')
-        # These parameters are derived again when a model is constructed.
         construction_derived_names = ('geometry_type', 'view_params_name', 'file_format',
                                       'version', 'use_gpu')
-        # These constructor arguments describe the execution environment rather
-        # than the model.
         environment_args = ('self', 'view_batch_size', 'compile_mode')
 
         ctor_names = [n for n in inspect.signature(type(self).__init__).parameters
@@ -3363,25 +3212,23 @@ class TomographyModel(ParameterHandler):
 
     def get_recon_dict(self, recon_params=None, notes=None, save_log=True, save_model=True, str_format=False):
         """
-        Collect the recon parameters, logs, notes, and optionally all model parameters into a dict
-        with entries 'recon_params', 'recon_log', 'notes', and 'model_params'.  This dict can be used with
+        This method collects the recon parameters, the logs, the notes, and optionally the
+        model parameters into a dict.  The user can pass the dict to
         :func:`mbirtorch.view_utils.slice_viewer` and :func:`mbirtorch.export_recon_hdf5`.
-        By default the entries hold their original values; str_format=True serializes each top-level
-        entry to a string.
 
         Args:
-            recon_params (dict, optional): dict of reconstruction parameters. Defaults to None.
-            notes (str, optional): User-supplied notes to attach to the dataset. Defaults to None.
-            save_log (bool, optional): If True, saves the internal log buffer (if available). Defaults to True.
-            save_model (bool, optional): If True, saves the model parameters. Defaults to True.
-            str_format (bool, optional): If True, then each top level entry is serialized to a string.
+            recon_params (dict, optional): The dict of reconstruction parameters.  Defaults to
+                None.
+            notes (str, optional): The user notes to attach to the dataset.  Defaults to None.
+            save_log (bool, optional): If True, the method saves the internal log buffer if it
+                exists.  Defaults to True.
+            save_model (bool, optional): If True, the method saves the model parameters.
+                Defaults to True.
+            str_format (bool, optional): If True, the method converts each top-level entry to a
+                string.
 
         Returns:
-            dict: A dict with entries
-                 - 'recon_params'
-                 - 'notes'
-                 - 'recon_log'
-                 - 'model_params'.
+            dict: A dict with entries 'recon_params', 'notes', 'recon_log', and 'model_params'.
 
         Example:
             >>> recon, recon_dict = ct_model.recon(sinogram)
@@ -3415,14 +3262,16 @@ class TomographyModel(ParameterHandler):
         return recon_dict
 
     def save_recon_hdf5(self, filepath, recon, recon_dict=None):
-        """Deprecated: use :func:`mbirtorch.export_recon_hdf5`."""
+        """This method is deprecated.  The function :func:`mbirtorch.export_recon_hdf5`
+        replaces it."""
         warnings.warn('save_recon_hdf5 is deprecated; use mbirtorch.export_recon_hdf5.', FutureWarning, stacklevel=2)
         from .utilities import export_recon_hdf5
         export_recon_hdf5(filepath, recon, recon_dict)
 
     @staticmethod
     def load_recon_hdf5(filepath):
-        """Deprecated: use :func:`mbirtorch.import_recon_hdf5`."""
+        """This method is deprecated.  The function :func:`mbirtorch.import_recon_hdf5`
+        replaces it."""
         warnings.warn('load_recon_hdf5 is deprecated; use mbirtorch.import_recon_hdf5.', FutureWarning, stacklevel=2)
         from .utilities import import_recon_hdf5
         return import_recon_hdf5(filepath)
