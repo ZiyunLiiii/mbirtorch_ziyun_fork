@@ -14,8 +14,8 @@ import torch
 from scipy.fft import dct, idct
 
 import mbirtorch
-from mbirtorch.mace4d import (MACE4DModel, apply_temporal_filter,
-                              temporal_filter_matrix)
+from mbirtorch.mace4d import (MACE4DModel, apply_temporal_filter, frame_center_angles,
+                              temporal_filter_matrix, view_angle_filter_matrix)
 
 NUM_VIEWS = 24          # 24 views over 360 degrees, 15 degrees per view
 DET_ROWS = 8
@@ -119,6 +119,45 @@ def test_filter_matrix_equals_the_transform_filter():
     along_axis_1 = apply_temporal_filter(x, axis_matrix, axis=1)
     moved = apply_temporal_filter(x.movedim(1, 0), axis_matrix, axis=0).movedim(0, 1)
     assert torch.equal(along_axis_1, moved)
+
+
+def test_view_angle_filter_removes_the_curves_of_the_frame_angle():
+    """At 6 frames per rotation over 4 whole turns, the filter with the harmonics 1 to 3
+    removes 5 curves, because sin(3 theta) is zero at these angles.  It removes cos(theta),
+    sin(2 theta), and cos(3 theta) terms and keeps a constant.  With the harmonic 1 alone, it
+    removes the cos(theta) term and keeps the rest.  The matrix is a symmetric projection whose
+    rows sum to 1.  The tolerance is float32 rounding.  One frame is refused."""
+    frames_per_rotation, num_turns = 6, 4
+    theta = 0.3 - 2 * np.pi / frames_per_rotation * np.arange(frames_per_rotation * num_turns)
+    m = view_angle_filter_matrix(theta).numpy().astype(np.float64)
+    symmetry, idempotence = np.max(np.abs(m - m.T)), np.max(np.abs(m @ m - m))
+    row_sum = np.max(np.abs(m.sum(axis=1) - 1))
+    removed = int(round(len(theta) - np.trace(m)))
+    print(f"curves removed {removed}, symmetry {symmetry:.2e}, idempotence {idempotence:.2e}, "
+          f"row sums {row_sum:.2e}")
+    assert m.shape == (len(theta), len(theta)) and removed == 5
+    assert symmetry < 1e-5 and idempotence < 1e-5 and row_sum < 1e-5
+
+    once = 0.2 * np.cos(theta)
+    higher = -0.1 * np.sin(2 * theta) + 0.05 * np.cos(3 * theta)
+    constant = 0.7
+    assert np.max(np.abs(m @ (constant + once + higher) - constant)) < 1e-5
+    first = view_angle_filter_matrix(theta, harmonics=(1,)).numpy().astype(np.float64)
+    assert np.max(np.abs(first @ (constant + once + higher) - (constant + higher))) < 1e-5
+
+    with pytest.raises(ValueError, match='at least 2'):
+        view_angle_filter_matrix([0.0])
+
+
+def test_frame_center_angles_are_the_middle_of_each_frame():
+    """With a view every -2.5 degrees and frames of 48 views every 24 views, the center of
+    frame k is the angle of view 24 k + 23.5.  This holds also for frames past the first
+    turn."""
+    angles = np.radians(-2.5 * np.arange(400))
+    view_slices = [slice(24 * k, 24 * k + 48) for k in range(15)]
+    expected = np.radians(-2.5 * (24 * np.arange(15) + 23.5))
+    difference = np.angle(np.exp(1j * (frame_center_angles(angles, view_slices) - expected)))
+    assert np.max(np.abs(difference)) < 1e-12
 
 
 def test_reconstructions_run_end_to_end_with_and_without_the_filter(device):

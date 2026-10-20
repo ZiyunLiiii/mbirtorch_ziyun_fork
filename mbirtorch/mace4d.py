@@ -30,6 +30,10 @@ _DENOISE_MAX_ITERATIONS = 15
 _DENOISE_STOP_THRESHOLD_PCT = 0.05
 # The size in bytes of each slab when the filter is applied to the data-fit outputs.
 _FILTER_SLAB_BYTES = 64 * 2 ** 20
+# The relative singular value below which view_angle_filter_matrix leaves out a curve.  A curve
+# is left out when it is zero at the frame angles, such as sin(3 theta) at 6 frames per
+# rotation, or when it repeats other curves.
+_ANGLE_CURVE_RANK_TOL = 1e-8
 
 # The name of each denoiser orientation and the spatial axis that it holds fixed.  The axis
 # index uses the order (frames, x, y, z).
@@ -102,6 +106,67 @@ def apply_temporal_filter(x, matrix, axis=0):
     moved = x.movedim(axis, 0)
     filtered = torch.tensordot(matrix, moved, dims=1)
     return filtered.movedim(0, axis)
+
+
+def view_angle_filter_matrix(frame_angles, harmonics=(1, 2, 3)):
+    """
+    This function returns the matrix of a filter along the frame axis that removes the part of
+    each voxel that varies with the view angle of the frame.  At each voxel, the filter removes
+    the least-squares fit of cos(k theta) and sin(k theta) for each k in ``harmonics``.  Here
+    theta is the center angle of each frame.  The filter keeps the mean over the frames.  It is
+    an alternative to :func:`temporal_filter_matrix`, and :func:`apply_temporal_filter` applies
+    it.
+
+    For P frames per rotation, use the harmonics 1 to P // 2.  The default suits 6 frames per
+    rotation.  The filter leaves out a curve that is zero at the frame angles or that repeats
+    other curves.
+
+    Args:
+        frame_angles (array): The center angle of each frame, in radians.  It needs at least 2
+            frames.  :func:`frame_center_angles` computes it for the frames of a
+            :class:`MACE4DModel`.
+        harmonics (list of int, optional): The values of k.  Defaults to (1, 2, 3).
+
+    Returns:
+        torch.Tensor: The float32 matrix of shape (num_frames, num_frames), on the CPU.
+    """
+    theta = np.asarray(frame_angles, dtype=np.float64)
+    if theta.ndim != 1 or len(theta) < 2:
+        raise ValueError('frame_angles must be a 1D array of at least 2 angles; '
+                         f'got shape {theta.shape}.')
+
+    # The removed curves span the columns of basis.  Their mean is removed first, so the filter
+    # keeps the mean over the frames.
+    curves = np.stack([f(k * theta) for k in harmonics for f in (np.cos, np.sin)], axis=1)
+    curves -= curves.mean(axis=0)
+    basis, singular_values, _ = np.linalg.svd(curves, full_matrices=False)
+    basis = basis[:, singular_values > _ANGLE_CURVE_RANK_TOL * singular_values.max()]
+    matrix = np.eye(len(theta)) - basis @ basis.T
+    return torch.as_tensor(matrix.astype(np.float32))
+
+
+def frame_center_angles(angles, view_slices):
+    """
+    This function returns the center view angle of each frame.  Use it to get the input of
+    :func:`view_angle_filter_matrix` for the frames of a :class:`MACE4DModel`.
+
+    Args:
+        angles (array): The angle of each view of the scan, in radians.
+        view_slices (list of slice): The views of each frame, as in ``MACE4DModel.view_slices``.
+
+    Returns:
+        numpy.ndarray: The center angle of each frame, in radians.
+
+    Example:
+        >>> mace4d = mbirtorch.MACE4DModel(ct_model, frames_per_rotation=6)
+        >>> theta = mbirtorch.frame_center_angles(ct_model.get_params('angles'), mace4d.view_slices)
+        >>> matrix = mbirtorch.view_angle_filter_matrix(theta, harmonics=(1, 2, 3))
+    """
+    angles = np.asarray(angles, dtype=np.float64)
+    # The angle of the summed unit vectors is the center of the views, also when the angles
+    # wrap past 2 pi.
+    return np.array([np.arctan2(np.sin(angles[s]).sum(), np.cos(angles[s]).sum())
+                     for s in view_slices])
 
 
 def _normalize_prior_weights(prior_weight):
