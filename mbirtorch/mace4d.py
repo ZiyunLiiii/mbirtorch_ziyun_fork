@@ -4,7 +4,7 @@ The module divides the scan into overlapping angular windows, one for each time 
 reconstructs one volume for each frame.  :class:`MACE4DModel` holds the volumes in one array
 of shape ``(frames, x, y, z)``.  It computes them as the MACE consensus of a data-fit agent
 and three qGGMRF denoisers.  The overlapping windows produce a periodic modulation along the
-frame axis.  :func:`sor_projector` builds the filter that removes this modulation.
+frame axis.  :func:`sor_filter_matrix` builds the filter that removes this modulation.
 """
 
 import concurrent.futures
@@ -30,7 +30,7 @@ _DENOISE_MAX_ITERATIONS = 15
 _DENOISE_STOP_THRESHOLD_PCT = 0.05
 # The size in bytes of each slab when the filter is applied to the data-fit outputs.
 _FILTER_SLAB_BYTES = 64 * 2 ** 20
-# The relative singular value below which sor_projector leaves out a harmonic.  A harmonic is
+# The relative singular value below which sor_filter_matrix leaves out a harmonic.  A harmonic is
 # left out when it is zero at the frame angles or repeats other harmonics there, as
 # sin(3 theta) does at 6 frames per rotation.  A model holds its angles in float32.  The
 # rounding of these angles gives such a harmonic a relative singular value of up to about 1e-5.
@@ -51,7 +51,7 @@ def apply_temporal_filter(x, matrix, axis=0):
 
     Args:
         x (torch.Tensor): The array to filter.
-        matrix (torch.Tensor): A square matrix from :func:`sor_projector`.  Its size
+        matrix (torch.Tensor): A square matrix from :func:`sor_filter_matrix`.  Its size
             equals the length of ``axis``.  The function moves it to the device and dtype of
             ``x``.
         axis (int, optional): The axis along which the matrix acts.  Defaults to 0.
@@ -65,10 +65,10 @@ def apply_temporal_filter(x, matrix, axis=0):
     return filtered.movedim(0, axis)
 
 
-def sor_projector(angles, order):
+def sor_filter_matrix(angles, order):
     """
-    This function returns the projector P of Sensor Orthogonal Reconstruction (SOR).  P is the
-    matrix of a filter along the frame axis.  The filter removes the part of each voxel that
+    This function returns the filter matrix P of Sensor Orthogonal Reconstruction (SOR).  P
+    acts along the frame axis.  The filter removes the part of each voxel that
     varies with the sensor angle theta of the frame.  At each voxel, it removes the
     least-squares fit of cos(m theta) and sin(m theta) for m = 1 to p, and it keeps the mean
     over the frames.  :class:`MACE4DModel` uses this filter when ``dejitter`` is on.  Use
@@ -96,8 +96,8 @@ def sor_projector(angles, order):
     harmonics -= harmonics.mean(axis=0)
     basis, singular_values, _ = np.linalg.svd(harmonics, full_matrices=False)
     basis = basis[:, singular_values > _HARMONIC_RANK_TOL * singular_values.max()]
-    projector = np.eye(len(theta)) - basis @ basis.T
-    return torch.as_tensor(projector.astype(np.float32))
+    matrix = np.eye(len(theta)) - basis @ basis.T
+    return torch.as_tensor(matrix.astype(np.float32))
 
 
 def _frame_angles(angles, view_slices):
@@ -403,7 +403,7 @@ class MACE4DModel(ParameterHandler):
             dejitter (bool): If True, the method applies the temporal filter along the frame
                 axis.  Defaults to True.
             sor_order (int): The highest harmonic p of the frame angle that the temporal filter
-                removes.  See :func:`sor_projector`.  Defaults to 3.
+                removes.  See :func:`sor_filter_matrix`.  Defaults to 3.
             dejitter_verbose (int): If nonzero, the method logs the harmonics that the filter
                 removes and the number of modes that it keeps.  Defaults to 0.
             sigma_noise (float or None): The noise level of all three denoisers.  None
@@ -709,14 +709,14 @@ class MACE4DModel(ParameterHandler):
         """This method returns the matrix of the temporal filter and one line of text that
         describes the filter.
 
-        The matrix is the SOR projector of the frame angles.  The matrix is None when the
+        The matrix is the SOR filter matrix of the frame angles.  The matrix is None when the
         filter would remove all change between the frames.
         """
         order = int(self.get_params('sor_order'))
         if self.num_frames > 1:
             required_params, _, _ = self.ct_model.get_all_params()
             angles = _frame_angles(required_params['angles'], self.view_slices)
-            matrix = sor_projector(angles, order)
+            matrix = sor_filter_matrix(angles, order)
             # The trace is the number of modes that the filter keeps.  One of them is the mean
             # over the frames.
             if round(float(matrix.trace())) > 1:

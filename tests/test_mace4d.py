@@ -1,6 +1,6 @@
 """Tests for the 4D reconstruction model and the frame-axis filter.
 
-The SOR projector is checked on the harmonics of the frame angle that it
+The SOR filter matrix is checked on the harmonics of the frame angle that it
 removes and on the terms that it keeps.  The model
 is checked on a 24-view cone-beam scan with a smooth sinogram.  A four-frame
 run with the filter on differs from the same run with it off, and a seeded
@@ -14,7 +14,7 @@ import pytest
 import torch
 
 import mbirtorch
-from mbirtorch.mace4d import MACE4DModel, _frame_angles, apply_temporal_filter, sor_projector
+from mbirtorch.mace4d import MACE4DModel, _frame_angles, apply_temporal_filter, sor_filter_matrix
 
 NUM_VIEWS = 24          # 24 views over 360 degrees, 15 degrees per view
 DET_ROWS = 8
@@ -55,17 +55,17 @@ def _four_frame_model():
 
 
 # ── the frame-axis filter matrix ─────────────────────────────────────────────
-def test_sor_projector_removes_the_harmonics_of_the_frame_angle():
-    """At 6 frames per rotation over 4 whole turns, the projector of order 3 removes 5
+def test_sor_filter_removes_the_harmonics_of_the_frame_angle():
+    """At 6 frames per rotation over 4 whole turns, the filter of order 3 removes 5
     harmonics, because sin(3 theta) is zero at these angles.  It removes cos(theta),
     sin(2 theta), and cos(3 theta) terms and keeps a constant.  At order 1, it removes the
-    cos(theta) term and keeps the rest.  The matrix is a symmetric projection whose rows sum
-    to 1.  The tolerance is float32 rounding.  One frame is refused.  Applying the matrix to
+    cos(theta) term and keeps the rest.  The matrix is symmetric and idempotent, and its rows
+    sum to 1.  The tolerance is float32 rounding.  One frame is refused.  Applying the matrix to
     a tensor gives the same result, and applying it along another axis equals moving that
     axis to the front and filtering there."""
     frames_per_rotation, num_turns = 6, 4
     theta = 0.3 - 2 * np.pi / frames_per_rotation * np.arange(frames_per_rotation * num_turns)
-    matrix = sor_projector(theta, 3)
+    matrix = sor_filter_matrix(theta, 3)
     assert matrix.dtype == torch.float32
     m = matrix.numpy().astype(np.float64)
     symmetry, idempotence = np.max(np.abs(m - m.T)), np.max(np.abs(m @ m - m))
@@ -80,11 +80,11 @@ def test_sor_projector_removes_the_harmonics_of_the_frame_angle():
     higher = -0.1 * np.sin(2 * theta) + 0.05 * np.cos(3 * theta)
     constant = 0.7
     assert np.max(np.abs(m @ (constant + once + higher) - constant)) < 1e-5
-    first = sor_projector(theta, 1).numpy().astype(np.float64)
+    first = sor_filter_matrix(theta, 1).numpy().astype(np.float64)
     assert np.max(np.abs(first @ (constant + once + higher) - (constant + higher))) < 1e-5
 
     with pytest.raises(ValueError, match='at least 2'):
-        sor_projector([0.0], 3)
+        sor_filter_matrix([0.0], 3)
 
     # On a tensor with the same signal at every voxel, the filter leaves the constant.
     signal = torch.as_tensor(constant + once + higher, dtype=torch.float32)
@@ -112,7 +112,7 @@ def test_frame_angles_are_the_middle_of_each_frame():
 def test_model_filter_from_float32_angles_equals_the_filter_of_the_exact_angles():
     """A model holds its angles in float32.  On a scan of 600 views, one every -2.5 degrees,
     the filter that the model builds at 6 frames per rotation and order 3 removes 5 harmonics.
-    It equals the projector of the exact frame angles to float32 rounding.  This holds when
+    It equals the filter of the exact frame angles to float32 rounding.  This holds when
     the angles grow past 2 pi and when they are given mod 2 pi."""
     num_views, frames_per_rotation = 600, 6
     exact = np.radians(-2.5 * np.arange(num_views))
@@ -122,7 +122,7 @@ def test_model_filter_from_float32_angles_equals_the_filter_of_the_exact_angles(
         model = MACE4DModel(ct_model, frames_per_rotation=frames_per_rotation)
         matrix, note = model._temporal_filter()
         centers = np.array([exact[s].mean() for s in model.view_slices])
-        reference = sor_projector(centers, 3)
+        reference = sor_filter_matrix(centers, 3)
         removed = int(round(model.num_frames - float(matrix.trace())))
         difference = float(torch.max(torch.abs(matrix - reference)))
         print(f"{model.num_frames} frames: harmonics removed {removed}, "
