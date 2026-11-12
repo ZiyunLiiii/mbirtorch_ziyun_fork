@@ -403,7 +403,7 @@ class MACE4DModel(ParameterHandler):
             dejitter (bool): If True, the method applies the temporal filter along the frame
                 axis.  Defaults to True.
             sor_order (int): The highest harmonic p of the frame angle that the temporal filter
-                removes.  See :func:`sor_filter_matrix`.  Defaults to 3.
+                removes.  Defaults to 3.
             dejitter_verbose (int): If nonzero, the method logs the harmonics that the filter
                 removes and the number of modes that it keeps.  Defaults to 0.
             sigma_noise (float or None): The noise level of all three denoisers.  None
