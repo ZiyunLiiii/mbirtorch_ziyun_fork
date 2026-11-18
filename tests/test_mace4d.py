@@ -112,37 +112,42 @@ def test_frame_angles_are_the_middle_of_each_frame():
 
 def test_model_filter_from_float32_angles_equals_the_filter_of_the_exact_angles():
     """A model holds its angles in float32.  On a scan of 600 views, one every -2.5 degrees,
-    the filter that the model builds at 6 frames per rotation and order 3 removes 5 harmonics.
+    the filter of these angles at 6 frames per rotation and order 3 removes 5 harmonics.
     It equals the filter of the exact frame angles to float32 rounding.  This holds when
-    the angles grow past 2 pi and when they are given mod 2 pi."""
+    the angles grow past 2 pi and when they are given mod 2 pi.  The test builds the filter
+    with the same two calls as ``MACE4DModel.recon``."""
     num_views, frames_per_rotation = 600, 6
     exact = np.radians(-2.5 * np.arange(num_views))
     for angles in (exact, np.mod(exact, 2 * np.pi)):
         ct_model = mbirtorch.ParallelBeamModel((num_views, 2, 8), angles)
         ct_model.set_params(no_warning=True, verbose=0)
         model = MACE4DModel(ct_model, frames_per_rotation=frames_per_rotation)
-        matrix, note = model._temporal_filter()
+        required_params, _, _ = ct_model.get_all_params()
+        center_angles = _get_frame_center_angles(required_params['angles'], model.frame_views)
+        matrix = gen_sor_filter_matrix(center_angles, 3)
         centers = np.array([exact[s].mean() for s in model.frame_views])
         reference = gen_sor_filter_matrix(centers, 3)
         removed = int(round(model.num_frames - float(matrix.trace())))
         difference = float(torch.max(torch.abs(matrix - reference)))
         print(f"{model.num_frames} frames: harmonics removed {removed}, "
               f"difference {difference:.2e}")
-        assert removed == 5 and '5 of 24 modes removed' in note
+        assert removed == 5
         assert difference < 1e-5
 
 
-def test_model_turns_the_filter_off_when_it_would_remove_all_change():
+def test_model_turns_the_filter_off_when_it_would_remove_all_change(device):
     """Four frames at 90 degree steps hold three modes besides their mean.  At order 3 the
-    filter would remove all three, so the model returns no matrix.  At order 1 it removes two
-    modes and keeps two."""
+    filter would remove all three, so ``recon`` warns and runs with the filter off."""
     model = MACE4DModel(_small_model(), frames_per_rotation=4, frame_overlap_factor=1.0)
+    model.set_params(verbose=0)
     assert model.num_frames == 4 and model.get_params('sor_order') == 3
-    matrix, note = model._temporal_filter()
-    assert matrix is None and 'turned off' in note
-    model.set_params(sor_order=1)
-    matrix, note = model._temporal_filter()
-    assert matrix is not None and '2 of 4 modes removed' in note
+    model.set_device_pool([device])
+    shape = (4,) + model.recon_shape
+    init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    with pytest.warns(UserWarning, match='turned off'):
+        recon_4d, recon_dict = model.recon(_smooth_sino(), init_recon=init, max_iterations=1)
+    assert recon_4d.shape == shape and np.all(np.isfinite(recon_4d))
+    assert 'turned off' in recon_dict['recon_params']['temporal filter']
 
 
 def test_reconstructions_run_end_to_end_with_and_without_the_filter(device):

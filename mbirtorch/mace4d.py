@@ -547,13 +547,26 @@ class MACE4DModel(ParameterHandler):
         filter_matrix = None
         dejitter_note = None
         if dejitter:
-            filter_matrix, dejitter_note = self._temporal_filter()
+            sor_order = int(self.get_params('sor_order'))
+            if num_frames > 1:
+                required_params, _, _ = self.ct_model.get_all_params()
+                center_angles = _get_frame_center_angles(required_params['angles'],
+                                                         self.frame_views)
+                filter_matrix = gen_sor_filter_matrix(center_angles, sor_order)
+                # The trace is the number of modes that the filter keeps.  One of them is the mean
+                # over the frames.
+                if round(float(filter_matrix.trace())) <= 1:
+                    filter_matrix = None
             if filter_matrix is None:
                 dejitter = False
+                dejitter_note = (f'turned off: at order {sor_order} it would remove all change '
+                                 f'between the {num_frames} frames')
                 warnings.warn(f'The temporal filter was {dejitter_note}.  Use more frames or a '
                               'smaller sor_order, or set dejitter=False to silence this warning.')
-            elif self.get_params('dejitter_verbose'):
-                self.logger.info(f'[MACE] Temporal filter: {dejitter_note}')
+            else:
+                dejitter_note = _describe_filter(filter_matrix, sor_order)
+                if self.get_params('dejitter_verbose'):
+                    self.logger.info(f'[MACE] Temporal filter: {dejitter_note}')
 
         pool = self.devices
         frame_devices = [pool[t % len(pool)] for t in range(num_frames)]
@@ -704,25 +717,6 @@ class MACE4DModel(ParameterHandler):
             'model_params': self.params.copy(),
         }
         return result, recon_dict
-
-    def _temporal_filter(self):
-        """This method returns the matrix of the temporal filter and one line of text that
-        describes the filter.
-
-        The matrix is the SOR filter matrix of the frame angles.  The matrix is None when the
-        filter would remove all change between the frames.
-        """
-        order = int(self.get_params('sor_order'))
-        if self.num_frames > 1:
-            required_params, _, _ = self.ct_model.get_all_params()
-            center_angles = _get_frame_center_angles(required_params['angles'], self.frame_views)
-            matrix = gen_sor_filter_matrix(center_angles, order)
-            # The trace is the number of modes that the filter keeps.  One of them is the mean
-            # over the frames.
-            if round(float(matrix.trace())) > 1:
-                return matrix, _describe_filter(matrix, order)
-        return None, (f'turned off: at order {order} it would remove all change between the '
-                      f'{self.num_frames} frames')
 
     def _prior_params(self):
         """This method returns the qGGMRF parameters of every denoiser.
