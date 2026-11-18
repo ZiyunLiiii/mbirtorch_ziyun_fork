@@ -36,7 +36,7 @@ recon_4d, recon_dict = mace4d.recon(sinogram, max_iterations=10)
 # the direct method, which is what a scan of a moving object gets without a
 # 4D method.
 direct_4d = []
-for s in mace4d.view_slices:
+for s in mace4d.frame_views:
     frame_model = mbirtorch.ParallelBeamModel((s.stop - s.start,) + sinogram.shape[1:], angles[s])
     direct_4d.append(frame_model.recon_fbp(sinogram[s]))
 direct_4d = np.stack(direct_4d)
@@ -44,7 +44,7 @@ direct_4d = np.stack(direct_4d)
 # The ground truth for each frame: the object at the step nearest the middle
 # of the frame's window of views.
 step_of_view = params['step_of_view']
-truth_4d = np.stack([phantom_4d[step_of_view[(s.start + s.stop) // 2]] for s in mace4d.view_slices])
+truth_4d = np.stack([phantom_4d[step_of_view[(s.start + s.stop) // 2]] for s in mace4d.frame_views])
 for name, volumes in (('FBP per window', direct_4d), ('4D MACE', recon_4d)):
     nrmse = np.linalg.norm(volumes - truth_4d) / np.linalg.norm(truth_4d)
     print(f'{name}: normalized RMS error over all frames {nrmse:.3f}')

@@ -14,7 +14,8 @@ import pytest
 import torch
 
 import mbirtorch
-from mbirtorch.mace4d import MACE4DModel, _frame_angles, apply_temporal_filter, sor_filter_matrix
+from mbirtorch.mace4d import (MACE4DModel, _get_frame_center_angles, apply_temporal_filter,
+                              gen_sor_filter_matrix)
 
 NUM_VIEWS = 24          # 24 views over 360 degrees, 15 degrees per view
 DET_ROWS = 8
@@ -65,7 +66,7 @@ def test_sor_filter_removes_the_harmonics_of_the_frame_angle():
     axis to the front and filtering there."""
     frames_per_rotation, num_turns = 6, 4
     theta = 0.3 - 2 * np.pi / frames_per_rotation * np.arange(frames_per_rotation * num_turns)
-    matrix = sor_filter_matrix(theta, 3)
+    matrix = gen_sor_filter_matrix(theta, 3)
     assert matrix.dtype == torch.float32
     m = matrix.numpy().astype(np.float64)
     symmetry, idempotence = np.max(np.abs(m - m.T)), np.max(np.abs(m @ m - m))
@@ -80,11 +81,11 @@ def test_sor_filter_removes_the_harmonics_of_the_frame_angle():
     higher = -0.1 * np.sin(2 * theta) + 0.05 * np.cos(3 * theta)
     constant = 0.7
     assert np.max(np.abs(m @ (constant + once + higher) - constant)) < 1e-5
-    first = sor_filter_matrix(theta, 1).numpy().astype(np.float64)
+    first = gen_sor_filter_matrix(theta, 1).numpy().astype(np.float64)
     assert np.max(np.abs(first @ (constant + once + higher) - (constant + higher))) < 1e-5
 
     with pytest.raises(ValueError, match='at least 2'):
-        sor_filter_matrix([0.0], 3)
+        gen_sor_filter_matrix([0.0], 3)
 
     # On a tensor with the same signal at every voxel, the filter leaves the constant.
     signal = torch.as_tensor(constant + once + higher, dtype=torch.float32)
@@ -103,9 +104,9 @@ def test_frame_angles_are_the_middle_of_each_frame():
     frame k is the angle of view 24 k + 23.5.  This holds also for frames past the first
     turn."""
     angles = np.radians(-2.5 * np.arange(400))
-    view_slices = [slice(24 * k, 24 * k + 48) for k in range(15)]
+    frame_views = [slice(24 * k, 24 * k + 48) for k in range(15)]
     expected = np.radians(-2.5 * (24 * np.arange(15) + 23.5))
-    difference = np.angle(np.exp(1j * (_frame_angles(angles, view_slices) - expected)))
+    difference = np.angle(np.exp(1j * (_get_frame_center_angles(angles, frame_views) - expected)))
     assert np.max(np.abs(difference)) < 1e-12
 
 
@@ -121,8 +122,8 @@ def test_model_filter_from_float32_angles_equals_the_filter_of_the_exact_angles(
         ct_model.set_params(no_warning=True, verbose=0)
         model = MACE4DModel(ct_model, frames_per_rotation=frames_per_rotation)
         matrix, note = model._temporal_filter()
-        centers = np.array([exact[s].mean() for s in model.view_slices])
-        reference = sor_filter_matrix(centers, 3)
+        centers = np.array([exact[s].mean() for s in model.frame_views])
+        reference = gen_sor_filter_matrix(centers, 3)
         removed = int(round(model.num_frames - float(matrix.trace())))
         difference = float(torch.max(torch.abs(matrix - reference)))
         print(f"{model.num_frames} frames: harmonics removed {removed}, "

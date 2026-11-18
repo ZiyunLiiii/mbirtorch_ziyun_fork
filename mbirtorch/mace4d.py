@@ -4,7 +4,7 @@ The module divides the scan into overlapping angular windows, one for each time 
 reconstructs one volume for each frame.  :class:`MACE4DModel` holds the volumes in one array
 of shape ``(frames, x, y, z)``.  It computes them as the MACE consensus of a data-fit agent
 and three qGGMRF denoisers.  The overlapping windows produce a periodic modulation along the
-frame axis.  :func:`sor_filter_matrix` builds the filter that removes this modulation.
+frame axis.  :func:`gen_sor_filter_matrix` builds the filter that removes this modulation.
 """
 
 import concurrent.futures
@@ -30,8 +30,8 @@ _DENOISE_MAX_ITERATIONS = 15
 _DENOISE_STOP_THRESHOLD_PCT = 0.05
 # The size in bytes of each slab when the filter is applied to the data-fit outputs.
 _FILTER_SLAB_BYTES = 64 * 2 ** 20
-# The relative singular value below which sor_filter_matrix leaves out a harmonic.  A harmonic is
-# left out when it is zero at the frame angles or repeats other harmonics there, as
+# The relative singular value below which gen_sor_filter_matrix leaves out a harmonic.  A
+# harmonic is left out when it is zero at the frame angles or repeats other harmonics there, as
 # sin(3 theta) does at 6 frames per rotation.  A model holds its angles in float32.  The
 # rounding of these angles gives such a harmonic a relative singular value of up to about 1e-5.
 _HARMONIC_RANK_TOL = 1e-4
@@ -51,7 +51,7 @@ def apply_temporal_filter(x, matrix, axis=0):
 
     Args:
         x (torch.Tensor): The array to filter.
-        matrix (torch.Tensor): A square matrix from :func:`sor_filter_matrix`.  Its size
+        matrix (torch.Tensor): A square matrix from :func:`gen_sor_filter_matrix`.  Its size
             equals the length of ``axis``.  The function moves it to the device and dtype of
             ``x``.
         axis (int, optional): The axis along which the matrix acts.  Defaults to 0.
@@ -65,7 +65,7 @@ def apply_temporal_filter(x, matrix, axis=0):
     return filtered.movedim(0, axis)
 
 
-def sor_filter_matrix(angles, order):
+def gen_sor_filter_matrix(angles, order):
     """
     This function returns the filter matrix P of Sensor Orthogonal Reconstruction (SOR).  P
     acts along the frame axis.  The filter removes the part of each voxel that
@@ -100,19 +100,19 @@ def sor_filter_matrix(angles, order):
     return torch.as_tensor(matrix.astype(np.float32))
 
 
-def _frame_angles(angles, view_slices):
+def _get_frame_center_angles(angles, frame_views):
     """This function returns the sensor angle of each frame, in radians.  It is the center
     angle of the views of the frame.
 
     Args:
         angles (array): The angle of each view of the scan, in radians.
-        view_slices (list of slice): The views of each frame, as in ``MACE4DModel.view_slices``.
+        frame_views (list of slice): The views of each frame, as in ``MACE4DModel.frame_views``.
     """
     angles = np.asarray(angles, dtype=np.float64)
     # The angle of the summed unit vectors is the center of the views, also when the angles
     # wrap past 2 pi.
     return np.array([np.arctan2(np.sin(angles[s]).sum(), np.cos(angles[s]).sum())
-                     for s in view_slices])
+                     for s in frame_views])
 
 
 def _normalize_prior_weights(prior_weight):
@@ -351,12 +351,12 @@ class MACE4DModel(ParameterHandler):
 
         if num_frames is not None and num_frames < 1:
             raise ValueError(f'num_frames must be at least 1; got {num_frames}.')
-        self.model_list, self.view_slices = construct_time_frame_models(
+        self.model_list, self.frame_views = construct_time_frame_models(
             ct_model, frames_per_rotation=frames_per_rotation,
             frame_overlap_factor=frame_overlap_factor)
         if num_frames is not None and num_frames < len(self.model_list):
             self.model_list = self.model_list[:num_frames]
-            self.view_slices = self.view_slices[:num_frames]
+            self.frame_views = self.frame_views[:num_frames]
         self.num_frames = len(self.model_list)
         self.recon_shape = tuple(int(n) for n in self.model_list[0].get_params('recon_shape'))
 
@@ -564,8 +564,8 @@ class MACE4DModel(ParameterHandler):
             self.logger.info(f'[MACE] Start 4D reconstruction with {num_frames} time frames.')
 
         frame_agents = [
-            ForwardProxAgent(self.model_list[t], sinogram[self.view_slices[t]],
-                             weights=None if weights is None else weights[self.view_slices[t]],
+            ForwardProxAgent(self.model_list[t], sinogram[self.frame_views[t]],
+                             weights=None if weights is None else weights[self.frame_views[t]],
                              sigma_prox=self.get_params('sigma_prox'),
                              inner_iterations=self.get_params('prox_num_iterations'),
                              device=frame_devices[t],
@@ -715,8 +715,8 @@ class MACE4DModel(ParameterHandler):
         order = int(self.get_params('sor_order'))
         if self.num_frames > 1:
             required_params, _, _ = self.ct_model.get_all_params()
-            angles = _frame_angles(required_params['angles'], self.view_slices)
-            matrix = sor_filter_matrix(angles, order)
+            center_angles = _get_frame_center_angles(required_params['angles'], self.frame_views)
+            matrix = gen_sor_filter_matrix(center_angles, order)
             # The trace is the number of modes that the filter keeps.  One of them is the mean
             # over the frames.
             if round(float(matrix.trace())) > 1:
@@ -921,7 +921,7 @@ class MACE4DModel(ParameterHandler):
             'seed': seed,
             'time frames': self.num_frames,
             'frame shape': self.recon_shape,
-            'views per frame': self.view_slices[0].stop - self.view_slices[0].start,
+            'views per frame': self.frame_views[0].stop - self.frame_views[0].start,
             'workers': f'{len(pool)}: ' + ', '.join(str(d) for d in pool),
             'init source': init_source,
             'weights': 'unit (weights=None)' if weights is None else 'supplied by caller',

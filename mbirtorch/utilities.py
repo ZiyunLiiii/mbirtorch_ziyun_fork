@@ -1231,10 +1231,10 @@ def construct_time_frame_models(model, frames_per_rotation=6, frame_overlap_fact
             between frames.  Defaults to 2.0.
 
     Returns:
-        (model_list, view_slices): One model and one slice for each frame.
+        (model_list, frame_views): One model and one slice for each frame.
             - model_list (list of TomographyModel): The model of each frame.
-            - view_slices (list of slice): The views of the full sinogram in each frame.
-              ``sinogram[view_slices[k]]`` is the sinogram of frame ``k``.
+            - frame_views (list of slice): The views of the full sinogram in each frame.
+              ``sinogram[frame_views[k]]`` is the sinogram of frame ``k``.
 
     Raises:
         ValueError: If the model has no 1D angle vector, if the angles have zero spacing, if
@@ -1242,8 +1242,8 @@ def construct_time_frame_models(model, frames_per_rotation=6, frame_overlap_fact
             longer than the scan.
 
     Example:
-        >>> frames, view_slices = mbirtorch.utilities.construct_time_frame_models(ct_model)
-        >>> sinogram_of_frame_1 = sinogram[view_slices[1]]
+        >>> frames, frame_views = mbirtorch.utilities.construct_time_frame_models(ct_model)
+        >>> sinogram_of_frame_1 = sinogram[frame_views[1]]
     """
     angle_stride = 2.0 * np.pi / frames_per_rotation
     angle_span_per_frame = frame_overlap_factor * angle_stride
@@ -1270,12 +1270,12 @@ def construct_time_frame_models(model, frames_per_rotation=6, frame_overlap_fact
         raise ValueError('The frame span cannot exceed the full scan.')
 
     model_list = []
-    view_slices = []
+    frame_views = []
     for start in range(0, num_views - views_per_frame + 1, stride):
         view_slice = slice(start, start + views_per_frame)
-        view_slices.append(view_slice)
+        frame_views.append(view_slice)
         model_list.append(copy_ct_model(model, new_angles=angles[view_slice]))
-    return model_list, view_slices
+    return model_list, frame_views
 
 
 def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta_det_channel, sinogram_shape, translation_vectors, voxel_row_aspect=1.0, voxel_slice_aspect=1.0):
