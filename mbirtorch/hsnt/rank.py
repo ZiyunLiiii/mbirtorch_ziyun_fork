@@ -16,7 +16,7 @@ def _loss_and_residual(T, W, H):
     """This function returns two float64 values: the loss of X = W @ H against T, and the mean
     of (T - e^-X)^2 / e^-X.  It computes both values in blocks of pixels to limit memory."""
     from ._loss import stable_nnal
-    from .outputs import _CHUNK_ELEMENTS
+    from ._loss import _CHUNK_ELEMENTS
     Hd = H.double()
     chunk = max(1, _CHUNK_ELEMENTS // T.shape[1])
     loss = resid = 0.0
@@ -96,6 +96,7 @@ def _subsample(T, n):
 
 def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, pool="auto", verbose=0):
     """This function estimates the number of spectral components in a hyperspectral dataset.
+    The spectral axis of the data is always the last axis.
 
     The function fits the data with ranks 1 to ``max_rank`` in turn.  It keeps adding components
     while the gain in log-likelihood of each new component is well above the gain expected from
