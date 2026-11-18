@@ -100,19 +100,19 @@ def gen_sor_filter_matrix(angles, order):
     return torch.as_tensor(matrix.astype(np.float32))
 
 
-def _get_frame_center_angles(angles, frame_views):
+def _get_frame_center_angles(angles, view_slices):
     """This function returns the sensor angle of each frame, in radians.  It is the center
     angle of the views of the frame.
 
     Args:
         angles (array): The angle of each view of the scan, in radians.
-        frame_views (list of slice): The views of each frame, as in ``MACE4DModel.frame_views``.
+        view_slices (list of slice): The views of each frame, as in ``MACE4DModel.view_slices``.
     """
     angles = np.asarray(angles, dtype=np.float64)
     # The angle of the summed unit vectors is the center of the views, also when the angles
     # wrap past 2 pi.
     return np.array([np.arctan2(np.sin(angles[s]).sum(), np.cos(angles[s]).sum())
-                     for s in frame_views])
+                     for s in view_slices])
 
 
 def _normalize_prior_weights(prior_weight):
@@ -351,12 +351,12 @@ class MACE4DModel(ParameterHandler):
 
         if num_frames is not None and num_frames < 1:
             raise ValueError(f'num_frames must be at least 1; got {num_frames}.')
-        self.model_list, self.frame_views = construct_time_frame_models(
+        self.model_list, self.view_slices = construct_time_frame_models(
             ct_model, frames_per_rotation=frames_per_rotation,
             frame_overlap_factor=frame_overlap_factor)
         if num_frames is not None and num_frames < len(self.model_list):
             self.model_list = self.model_list[:num_frames]
-            self.frame_views = self.frame_views[:num_frames]
+            self.view_slices = self.view_slices[:num_frames]
         self.num_frames = len(self.model_list)
         self.recon_shape = tuple(int(n) for n in self.model_list[0].get_params('recon_shape'))
 
@@ -551,7 +551,7 @@ class MACE4DModel(ParameterHandler):
             if num_frames > 1:
                 required_params, _, _ = self.ct_model.get_all_params()
                 center_angles = _get_frame_center_angles(required_params['angles'],
-                                                         self.frame_views)
+                                                         self.view_slices)
                 filter_matrix = gen_sor_filter_matrix(center_angles, sor_order)
                 # The trace is the number of modes that the filter keeps.  One of them is the mean
                 # over the frames.
@@ -577,8 +577,8 @@ class MACE4DModel(ParameterHandler):
             self.logger.info(f'[MACE] Start 4D reconstruction with {num_frames} time frames.')
 
         frame_agents = [
-            ForwardProxAgent(self.model_list[t], sinogram[self.frame_views[t]],
-                             weights=None if weights is None else weights[self.frame_views[t]],
+            ForwardProxAgent(self.model_list[t], sinogram[self.view_slices[t]],
+                             weights=None if weights is None else weights[self.view_slices[t]],
                              sigma_prox=self.get_params('sigma_prox'),
                              inner_iterations=self.get_params('prox_num_iterations'),
                              device=frame_devices[t],
@@ -915,7 +915,7 @@ class MACE4DModel(ParameterHandler):
             'seed': seed,
             'time frames': self.num_frames,
             'frame shape': self.recon_shape,
-            'views per frame': self.frame_views[0].stop - self.frame_views[0].start,
+            'views per frame': self.view_slices[0].stop - self.view_slices[0].start,
             'workers': f'{len(pool)}: ' + ', '.join(str(d) for d in pool),
             'init source': init_source,
             'weights': 'unit (weights=None)' if weights is None else 'supplied by caller',

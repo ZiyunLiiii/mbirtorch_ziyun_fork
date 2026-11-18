@@ -104,9 +104,9 @@ def test_frame_angles_are_the_middle_of_each_frame():
     frame k is the angle of view 24 k + 23.5.  This holds also for frames past the first
     turn."""
     angles = np.radians(-2.5 * np.arange(400))
-    frame_views = [slice(24 * k, 24 * k + 48) for k in range(15)]
+    view_slices = [slice(24 * k, 24 * k + 48) for k in range(15)]
     expected = np.radians(-2.5 * (24 * np.arange(15) + 23.5))
-    difference = np.angle(np.exp(1j * (_get_frame_center_angles(angles, frame_views) - expected)))
+    difference = np.angle(np.exp(1j * (_get_frame_center_angles(angles, view_slices) - expected)))
     assert np.max(np.abs(difference)) < 1e-12
 
 
@@ -123,9 +123,9 @@ def test_model_filter_from_float32_angles_equals_the_filter_of_the_exact_angles(
         ct_model.set_params(no_warning=True, verbose=0)
         model = MACE4DModel(ct_model, frames_per_rotation=frames_per_rotation)
         required_params, _, _ = ct_model.get_all_params()
-        center_angles = _get_frame_center_angles(required_params['angles'], model.frame_views)
+        center_angles = _get_frame_center_angles(required_params['angles'], model.view_slices)
         matrix = gen_sor_filter_matrix(center_angles, 3)
-        centers = np.array([exact[s].mean() for s in model.frame_views])
+        centers = np.array([exact[s].mean() for s in model.view_slices])
         reference = gen_sor_filter_matrix(centers, 3)
         removed = int(round(model.num_frames - float(matrix.trace())))
         difference = float(torch.max(torch.abs(matrix - reference)))
